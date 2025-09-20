@@ -1,8 +1,10 @@
-google-auth
+flask
 python-dotenv
-Flask
-gunicorn
-line-bot-sdk
-google-generativeai
+line-bot-sdk==3.7.0
 gspread
-oauth2client
+google-auth
+google-auth-oauthlib
+google-auth-httplib2
+google-api-python-client
+google-generativeai
+gunicorn
