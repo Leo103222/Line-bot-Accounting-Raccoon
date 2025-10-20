@@ -35,9 +35,10 @@ if not all([LINE_CHANNEL_ACCESS_TOKEN, LINE_CHANNEL_SECRET, GEMINI_API_KEY]):
     raise ValueError("金鑰未配置，請檢查 .env 檔案")
 else:
     logger.info("所有金鑰已成功從 .env 載入。")
+    logger.info(f"LINE_CHANNEL_ACCESS_TOKEN (前10字): {LINE_CHANNEL_ACCESS_TOKEN[:10]}...")
 
 # === 初始化 Flask 應用程式 ===
-app = Flask(__name__)  # 明確定義 Flask 應用
+app = Flask(__name__)
 logger.info("Flask application initialized successfully.")
 
 # === 配置 LINE 與 Gemini API 客戶端 ===
@@ -46,6 +47,9 @@ try:
     messaging_api = MessagingApi(LINE_CHANNEL_ACCESS_TOKEN)
     genai.configure(api_key=GEMINI_API_KEY)
     gemini_model = genai.GenerativeModel('gemini-1.5-flash')
+    # 驗證 messaging_api 初始化
+    if not isinstance(messaging_api, MessagingApi):
+        raise ValueError("MessagingApi 初始化失敗，可能是 LINE_CHANNEL_ACCESS_TOKEN 無效")
 except Exception as e:
     logger.error(f"API 客戶端初始化失敗: {e}")
     raise
@@ -58,11 +62,7 @@ def get_sheets_workbook():
     """
     logger.info("正在初始化 Google Sheets 憑證...")
     try:
-        # 明確指定 Google Sheets API 範圍
-        scopes = [
-            "https://www.googleapis.com/auth/spreadsheets",
-            "https://www.googleapis.com/auth/drive.readonly"  # 添加 Drive 範圍以確保存取
-        ]
+        scopes = ["https://www.googleapis.com/auth/spreadsheets"]
         if "GOOGLE_CREDENTIALS" in os.environ:
             logger.info("使用環境變數 GOOGLE_CREDENTIALS 建立憑證。")
             creds_info = json.loads(os.environ["GOOGLE_CREDENTIALS"])
@@ -91,6 +91,37 @@ def get_sheets_workbook():
     except Exception as e:
         logger.error(f"Google Sheets 初始化失敗：{e}", exc_info=True)
         return None
+
+def ensure_worksheets(workbook):
+    """
+    確保 Google Sheet 中存在 Transactions 和 Budgets 工作表，若不存在則創建
+    """
+    try:
+        # 檢查 Transactions 工作表
+        try:
+            trx_sheet = workbook.worksheet('Transactions')
+        except gspread.exceptions.WorksheetNotFound:
+            logger.info("未找到 Transactions 工作表，正在創建...")
+            trx_sheet = workbook.add_worksheet(title='Transactions', rows=1000, cols=10)
+            # 設置標頭
+            trx_sheet.append_row(['日期', '類別', '金額', '使用者ID', '使用者名稱', '備註'])
+            logger.info("Transactions 工作表創建成功")
+
+        # 檢查 Budgets 工作表
+        try:
+            budget_sheet = workbook.worksheet('Budgets')
+        except gspread.exceptions.WorksheetNotFound:
+            logger.info("未找到 Budgets 工作表，正在創建...")
+            budget_sheet = workbook.add_worksheet(title='Budgets', rows=100, cols=5)
+            # 設置標頭
+            budget_sheet.append_row(['使用者ID', '類別', '限額'])
+            logger.info("Budgets 工作表創建成功")
+
+        return trx_sheet, budget_sheet
+
+    except Exception as e:
+        logger.error(f"創建或檢查工作表失敗：{e}", exc_info=True)
+        return None, None
 
 def get_user_profile_name(user_id):
     try:
@@ -148,12 +179,10 @@ def handle_message(event):
             logger.error(f"回覆訊息失敗：{e}", exc_info=True)
         return
 
-    try:
-        trx_sheet = workbook.worksheet('Transactions')
-        budget_sheet = workbook.worksheet('Budgets')
-    except gspread.exceptions.WorksheetNotFound as e:
-        logger.error(f"找不到工作表: {e}")
-        reply_text = "糟糕！找不到 'Transactions' 或 'Budgets' 工作表，請檢查你的 Google Sheet 設定。"
+    # === 確保工作表存在 ===
+    trx_sheet, budget_sheet = ensure_worksheets(workbook)
+    if not trx_sheet or not budget_sheet:
+        reply_text = "糟糕！無法創建或存取 'Transactions' 或 'Budgets' 工作表，請檢查 Google Sheet 設定。"
         try:
             messaging_api.reply_message(
                 ReplyMessageRequest(
@@ -540,5 +569,5 @@ def handle_view_budget(trx_sheet, budget_sheet, user_id, event_time):
 # === 主程式入口 ===
 if __name__ == "__main__":
     logger.info("Starting Flask server locally...")
-    port = int(os.getenv('PORT', 10000))  # Render 預設端口為 10000
-    app.run(host='0.0.0.0', port=port, debug=False)  # debug=False 適配 Render
+    port = int(os.getenv('PORT', 10000))
+    app.run(host='0.0.0.0', port=port, debug=False)
