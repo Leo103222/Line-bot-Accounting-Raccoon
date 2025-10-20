@@ -3,7 +3,7 @@ import logging
 import re
 import json
 import gspread
-from google import genai # <- 步驟 1：修改 import
+from google import genai # <- 1. 修改 import
 from flask import Flask, request, abort
 from linebot import WebhookHandler, LineBotApi
 from linebot.exceptions import InvalidSignatureError, LineBotApiError
@@ -44,7 +44,7 @@ else:
 app = Flask(__name__)
 logger.info("Flask application initialized successfully.")
 
-# === 步驟 2：修改 Gemini API 初始化 ===
+# === 配置 LINE 與 Gemini API 客戶端 ===
 try:
     if not LINE_CHANNEL_ACCESS_TOKEN or not re.match(r'^[A-Za-z0-9+/=]+$', LINE_CHANNEL_ACCESS_TOKEN):
         logger.error("LINE_CHANNEL_ACCESS_TOKEN 格式無效，可能包含空格或無效字符")
@@ -52,10 +52,11 @@ try:
     handler = WebhookHandler(LINE_CHANNEL_SECRET)
     line_bot_api = LineBotApi(LINE_CHANNEL_ACCESS_TOKEN)
     
-    # === 新的初始化方式 ===
+    # === 2. 修改 Gemini API 初始化 ===
+    # genai.configure(api_key=GEMINI_API_KEY) # 舊的
+    # gemini_model = genai.GenerativeModel('gemini-1.5-flash') # 舊的
     gemini_client = genai.Client(api_key=GEMINI_API_KEY)
-    # 我們把要用的模型名稱存在一個變數 (推薦使用 pro 或較新模型)
-    gemini_model_name = 'gemini-1.5-pro' 
+    gemini_model_name = 'gemini-1.5-pro' # 使用 Pro 或更新的模型
     # ===
     
     logger.debug("LINE 和 Gemini API 客戶端初始化成功")
@@ -251,10 +252,10 @@ def handle_message(event):
         elif text == "查看預算":
             reply_text = handle_view_budget(trx_sheet, budget_sheet, user_id, event_time)
         else:
-            # === 步驟 3：修改 handle_message 呼叫 ===
             user_name = get_user_profile_name(user_id)
-            # 傳入 client 和 model_name
-            reply_text = handle_nlp_record(gemini_client, gemini_model_name, trx_sheet, text, user_id, user_name, event_time)
+            # === 3. 修改 handle_message 呼叫 ===
+            # reply_text = handle_nlp_record(trx_sheet, text, user_id, user_name, event_time) # 舊的
+            reply_text = handle_nlp_record(gemini_client, gemini_model_name, trx_sheet, text, user_id, user_name, event_time) # 新的
 
     except Exception as e:
         logger.error(f"處理指令 '{text}' 失敗：{e}", exc_info=True)
@@ -273,8 +274,9 @@ def handle_message(event):
 
 # === 核心功能函式 (Helper Functions) ===
 
-# === 步驟 4：修改 handle_nlp_record 函式定義 ===
-def handle_nlp_record(client, model_name, sheet, text, user_id, user_name, event_time):
+# === 4. 修改 handle_nlp_record 函式定義 ===
+# def handle_nlp_record(sheet, text, user_id, user_name, event_time): # 舊的
+def handle_nlp_record(client, model_name, sheet, text, user_id, user_name, event_time): # 新的
     logger.debug(f"處理自然語言記帳指令：{text}")
     today = event_time.date()
     today_str = today.strftime('%Y-%m-%d')
@@ -336,8 +338,9 @@ def handle_nlp_record(client, model_name, sheet, text, user_id, user_name, event
     try:
         logger.debug("發送 prompt 至 Gemini API")
         
-        # === 步驟 5：修改 API 呼叫 ===
-        response = client.models.generate_content(
+        # === 5. 修改 API 呼叫 ===
+        # response = gemini_model.generate_content(prompt) # 舊的
+        response = client.models.generate_content( # 新的
             model=model_name,
             contents=prompt
         )
@@ -380,7 +383,6 @@ def handle_nlp_record(client, model_name, sheet, text, user_id, user_name, event
         return "糟糕！AI 分析器暫時罷工了 (JSON解析失敗)... 請稍後再試。"
     except Exception as e:
         logger.error(f"Gemini API 呼叫或 GSheet 寫入失敗：{e}", exc_info=True)
-        # 顯示詳細的 API 錯誤
         return f"目前我無法處理這個請求：{str(e)}"
 
 def handle_check_balance(sheet, user_id):
@@ -520,7 +522,7 @@ def handle_set_budget(sheet, text, user_id):
             return f"✅ 已設置預算：{category} {limit} 元"
     except Exception as e:
         logger.error(f"設置預算失敗：{e}", exc_info=True)
-        return f"設置預G算失敗：{str(e)}"
+        return f"設置預算失敗：{str(e)}"
 
 def handle_view_budget(trx_sheet, budget_sheet, user_id, event_time):
     logger.debug(f"處理 '查看預算' 指令，user_id: {user_id}")
