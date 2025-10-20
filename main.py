@@ -5,10 +5,9 @@ import json
 import gspread
 import google.generativeai as genai
 from flask import Flask, request, abort
-from linebot.v3 import WebhookHandler
-from linebot.v3.exceptions import InvalidSignatureError
-from linebot.v3.webhooks.models import MessageEvent, TextMessageContent
-from linebot.v3.messaging import TextMessage, MessagingApi, ReplyMessageRequest
+from linebot import WebhookHandler, LineBotApi
+from linebot.exceptions import InvalidSignatureError
+from linebot.models import MessageEvent, TextMessageContent, TextSendMessage  # 修正：新增 TextSendMessage
 from google.oauth2.service_account import Credentials
 from datetime import datetime, timedelta
 from dotenv import load_dotenv
@@ -49,13 +48,13 @@ try:
         logger.error("LINE_CHANNEL_ACCESS_TOKEN 格式無效，可能包含空格或無效字符")
         raise ValueError("LINE_CHANNEL_ACCESS_TOKEN 格式無效")
     handler = WebhookHandler(LINE_CHANNEL_SECRET)
-    messaging_api = MessagingApi(LINE_CHANNEL_ACCESS_TOKEN)
+    line_bot_api = LineBotApi(LINE_CHANNEL_ACCESS_TOKEN)
     genai.configure(api_key=GEMINI_API_KEY)
     gemini_model = genai.GenerativeModel('gemini-1.5-flash')
-    # 驗證 messaging_api 初始化
-    if not isinstance(messaging_api, MessagingApi):
-        logger.error(f"MessagingApi 初始化失敗，LINE_CHANNEL_ACCESS_TOKEN: {LINE_CHANNEL_ACCESS_TOKEN[:10]}...")
-        raise ValueError("MessagingApi 初始化失敗，可能是 LINE_CHANNEL_ACCESS_TOKEN 無效")
+    # 驗證 line_bot_api 初始化
+    if not isinstance(line_bot_api, LineBotApi):
+        logger.error(f"LineBotApi 初始化失敗，LINE_CHANNEL_ACCESS_TOKEN: {LINE_CHANNEL_ACCESS_TOKEN[:10]}...")
+        raise ValueError("LineBotApi 初始化失敗，可能是 LINE_CHANNEL_ACCESS_TOKEN 無效")
 except Exception as e:
     logger.error(f"API 客戶端初始化失敗: {e}", exc_info=True)
     raise
@@ -68,10 +67,7 @@ def get_sheets_workbook():
     """
     logger.info("正在初始化 Google Sheets 憑證...")
     try:
-        # 使用 Google Sheets API 範圍，根據需要可加入 Google Drive API
         scopes = ["https://www.googleapis.com/auth/spreadsheets"]
-        # 若需要 Google Drive API，取消以下註解：
-        # scopes.append("https://www.googleapis.com/auth/drive")
         if "GOOGLE_CREDENTIALS" in os.environ:
             logger.info("使用環境變數 GOOGLE_CREDENTIALS 建立憑證。")
             creds_info = json.loads(os.environ["GOOGLE_CREDENTIALS"])
@@ -107,23 +103,19 @@ def ensure_worksheets(workbook):
     確保 Google Sheet 中存在 Transactions 和 Budgets 工作表，若不存在則創建
     """
     try:
-        # 檢查 Transactions 工作表
         try:
             trx_sheet = workbook.worksheet('Transactions')
         except gspread.exceptions.WorksheetNotFound:
             logger.info("未找到 Transactions 工作表，正在創建...")
             trx_sheet = workbook.add_worksheet(title='Transactions', rows=1000, cols=10)
-            # 設置標頭
             trx_sheet.append_row(['日期', '類別', '金額', '使用者ID', '使用者名稱', '備註'])
             logger.info("Transactions 工作表創建成功")
 
-        # 檢查 Budgets 工作表
         try:
             budget_sheet = workbook.worksheet('Budgets')
         except gspread.exceptions.WorksheetNotFound:
             logger.info("未找到 Budgets 工作表，正在創建...")
             budget_sheet = workbook.add_worksheet(title='Budgets', rows=100, cols=5)
-            # 設置標頭
             budget_sheet.append_row(['使用者ID', '類別', '限額'])
             logger.info("Budgets 工作表創建成功")
 
@@ -135,7 +127,7 @@ def ensure_worksheets(workbook):
 
 def get_user_profile_name(user_id):
     try:
-        profile = messaging_api.get_profile(user_id)
+        profile = line_bot_api.get_profile(user_id)
         return profile.display_name
     except Exception as e:
         logger.error(f"無法獲取使用者 {user_id} 的個人資料：{e}")
@@ -178,12 +170,7 @@ def handle_message(event):
     if not workbook:
         reply_text = "糟糕！小浣熊的帳本(Google Sheet)連接失敗了 😵 請檢查憑證設置或 Google Sheets API 權限。"
         try:
-            messaging_api.reply_message(
-                ReplyMessageRequest(
-                    reply_token=reply_token,
-                    messages=[TextMessage(text=reply_text)]
-                )
-            )
+            line_bot_api.reply_message(reply_token, TextSendMessage(text=reply_text))
             logger.info("Reply sent successfully")
         except Exception as e:
             logger.error(f"回覆訊息失敗：{e}", exc_info=True)
@@ -194,12 +181,7 @@ def handle_message(event):
     if not trx_sheet or not budget_sheet:
         reply_text = "糟糕！無法創建或存取 'Transactions' 或 'Budgets' 工作表，請檢查 Google Sheet 設定。"
         try:
-            messaging_api.reply_message(
-                ReplyMessageRequest(
-                    reply_token=reply_token,
-                    messages=[TextMessage(text=reply_text)]
-                )
-            )
+            line_bot_api.reply_message(reply_token, TextSendMessage(text=reply_text))
             logger.info("Reply sent successfully")
         except Exception as e:
             logger.error(f"回覆訊息失敗：{e}", exc_info=True)
@@ -255,12 +237,7 @@ def handle_message(event):
 
     logger.info(f"Final Reply:\n{reply_text}")
     try:
-        messaging_api.reply_message(
-            ReplyMessageRequest(
-                reply_token=reply_token,
-                messages=[TextMessage(text=reply_text)]
-            )
-        )
+        line_bot_api.reply_message(reply_token, TextSendMessage(text=reply_text))
         logger.info("Reply sent successfully")
     except Exception as e:
         logger.error(f"回覆訊息失敗：{e}", exc_info=True)
