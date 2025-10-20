@@ -35,7 +35,7 @@ if not all([LINE_CHANNEL_ACCESS_TOKEN, LINE_CHANNEL_SECRET, GEMINI_API_KEY]):
     raise ValueError("金鑰未配置，請檢查 .env 檔案")
 else:
     logger.info("所有金鑰已成功從 .env 載入。")
-    logger.info(f"LINE_CHANNEL_ACCESS_TOKEN (前10字): {LINE_CHANNEL_ACCESS_TOKEN[:10]}...")
+    logger.info(f"LINE_CHANNEL_ACCESS_TOKEN (前10字): {LINE_CHANNEL_ACCESS_TOKEN[:10] if LINE_CHANNEL_ACCESS_TOKEN else '未設置'}...")
     logger.info(f"GOOGLE_SHEET_NAME: {GOOGLE_SHEET_NAME}")
 
 # === 初始化 Flask 應用程式 ===
@@ -44,6 +44,10 @@ logger.info("Flask application initialized successfully.")
 
 # === 配置 LINE 與 Gemini API 客戶端 ===
 try:
+    # 驗證 LINE_CHANNEL_ACCESS_TOKEN 格式
+    if not LINE_CHANNEL_ACCESS_TOKEN or not re.match(r'^[A-Za-z0-9+/=]+$', LINE_CHANNEL_ACCESS_TOKEN):
+        logger.error("LINE_CHANNEL_ACCESS_TOKEN 格式無效，可能包含空格或無效字符")
+        raise ValueError("LINE_CHANNEL_ACCESS_TOKEN 格式無效")
     handler = WebhookHandler(LINE_CHANNEL_SECRET)
     messaging_api = MessagingApi(LINE_CHANNEL_ACCESS_TOKEN)
     genai.configure(api_key=GEMINI_API_KEY)
@@ -64,7 +68,10 @@ def get_sheets_workbook():
     """
     logger.info("正在初始化 Google Sheets 憑證...")
     try:
+        # 使用 Google Sheets API 範圍，根據需要可加入 Google Drive API
         scopes = ["https://www.googleapis.com/auth/spreadsheets"]
+        # 若需要 Google Drive API，取消以下註解：
+        # scopes.append("https://www.googleapis.com/auth/drive")
         if "GOOGLE_CREDENTIALS" in os.environ:
             logger.info("使用環境變數 GOOGLE_CREDENTIALS 建立憑證。")
             creds_info = json.loads(os.environ["GOOGLE_CREDENTIALS"])
