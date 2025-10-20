@@ -619,10 +619,6 @@ def handle_view_budget(trx_sheet, budget_sheet, user_id, event_time):
 
 # === 主程式入口 ===
 if __name__ == "__main__":
-    # 啟動 Flask 伺服器
-    # 你需要一個 ngrok 這樣的工具把這個網址暴露給 LINE
-    logger.info("Starting Flask server...")
-    port = int(os.getenv('PORT', 5000))
-    # 在本地開發時，debug=True 很好用
-    # 但在部署到 Google Cloud Run 時，請確保 debug=False
-    app.run(host='0.0.0.0', port=port, debug=True)
+    # 僅在本地測試時啟動 Flask
+    logger.info("Starting Flask server locally...")
+    app.run(host='0.0.0.0', port=int(os.getenv('PORT', 5000)), debug=True)
