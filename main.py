@@ -58,24 +58,50 @@ except Exception as e:
     raise
 
 # === Google Sheets 初始化 ===
+import json
+from google.oauth2 import service_account
+
 def get_sheets_workbook():
     """
     初始化 Google Sheets 客戶端並返回工作簿 (Workbook) 物件
+    支援兩種模式：
+      1. 本地端：使用實體 service_account.json 檔案
+      2. Render 雲端：使用環境變數 GOOGLE_CREDENTIALS
     """
-    logger.info(f"正在使用 {SERVICE_ACCOUNT_FILE} 連接 Google Sheets...")
+    logger.info("正在初始化 Google Sheets 憑證...")
+
     try:
-        scope = ['https://www.googleapis.com/auth/spreadsheets']
-        creds = Credentials.from_service_account_file(SERVICE_ACCOUNT_FILE, scopes=scope)
+        # 1️⃣ Render 模式：若環境中有 GOOGLE_CREDENTIALS，就從中讀取 JSON
+        if "GOOGLE_CREDENTIALS" in os.environ:
+            logger.info("使用環境變數 GOOGLE_CREDENTIALS 建立憑證。")
+            creds_info = json.loads(os.environ["GOOGLE_CREDENTIALS"])
+            creds = service_account.Credentials.from_service_account_info(
+                creds_info, scopes=["https://www.googleapis.com/auth/spreadsheets"]
+            )
+        else:
+            # 2️⃣ 本地開發模式：從 service_account.json 讀取
+            SERVICE_ACCOUNT_FILE = os.getenv("SERVICE_ACCOUNT_FILE", "service_account.json")
+            logger.info(f"使用本地檔案 {SERVICE_ACCOUNT_FILE} 建立憑證。")
+            creds = service_account.Credentials.from_service_account_file(
+                SERVICE_ACCOUNT_FILE, scopes=["https://www.googleapis.com/auth/spreadsheets"]
+            )
+
+        # 建立 gspread 客戶端
         client = gspread.authorize(creds)
-        # 返回整個工作簿
-        return client.open(GOOGLE_SHEET_NAME)
+        sheet_name = os.getenv("GOOGLE_SHEET_NAME", "記帳小浣熊資料庫")
+        logger.info(f"成功授權，正在開啟試算表：{sheet_name}")
+        return client.open(sheet_name)
+
     except FileNotFoundError:
-        logger.error(f"!!! 找不到 {SERVICE_ACCOUNT_FILE} 檔案 !!!")
-        logger.error("請確認 'service_account.json' 檔案在專案根目錄下。")
+        logger.error("找不到 service_account.json 檔案，請確認檔案位置或設定 GOOGLE_CREDENTIALS。")
+        return None
+    except json.JSONDecodeError:
+        logger.error("GOOGLE_CREDENTIALS JSON 格式錯誤，請檢查環境變數內容。")
         return None
     except Exception as e:
-        logger.error(f"Failed to get sheets client: {e}")
+        logger.error(f"Google Sheets 初始化失敗：{e}", exc_info=True)
         return None
+
 
 def get_user_profile_name(user_id):
     """
