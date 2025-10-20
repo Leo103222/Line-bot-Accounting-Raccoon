@@ -24,18 +24,20 @@ LINE_CHANNEL_ACCESS_TOKEN = os.getenv("LINE_CHANNEL_ACCESS_TOKEN")
 LINE_CHANNEL_SECRET = os.getenv("LINE_CHANNEL_SECRET")
 GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
 GOOGLE_SHEET_NAME = os.getenv("GOOGLE_SHEET_NAME", '記帳小浣熊資料庫')
+GOOGLE_SHEET_ID = os.getenv("GOOGLE_SHEET_ID")  # 新增
 
 # === 步驟 3：驗證金鑰是否已載入 ===
-if not all([LINE_CHANNEL_ACCESS_TOKEN, LINE_CHANNEL_SECRET, GEMINI_API_KEY]):
+if not all([LINE_CHANNEL_ACCESS_TOKEN, LINE_CHANNEL_SECRET, GEMINI_API_KEY, GOOGLE_SHEET_ID]):
     logger.error("!!! 關鍵金鑰載入失敗 !!!")
     logger.error("請檢查：")
     logger.error("1. 專案資料夾中是否有 .env 檔案？")
-    logger.error("2. .env 檔案中是否正確填寫了 LINE_... 和 GEMINI_...？")
+    logger.error("2. .env 檔案中是否正確填寫了 LINE_..., GEMINI_..., GOOGLE_SHEET_ID？")
     raise ValueError("金鑰未配置，請檢查 .env 檔案")
 else:
     logger.info("所有金鑰已成功從 .env 載入。")
     logger.info(f"LINE_CHANNEL_ACCESS_TOKEN (前10字): {LINE_CHANNEL_ACCESS_TOKEN[:10] if LINE_CHANNEL_ACCESS_TOKEN else '未設置'}...")
     logger.info(f"GOOGLE_SHEET_NAME: {GOOGLE_SHEET_NAME}")
+    logger.info(f"GOOGLE_SHEET_ID: {GOOGLE_SHEET_ID}")
 
 # === 初始化 Flask 應用程式 ===
 app = Flask(__name__)
@@ -61,7 +63,7 @@ except Exception as e:
 def get_sheets_workbook():
     """
     初始化 Google Sheets 客戶端並返回工作簿 (Workbook) 物件
-    優先使用環境變數 GOOGLE_CREDENTIALS，適配 Render 雲端環境
+    使用 GOOGLE_SHEET_ID 存取試算表
     """
     logger.info("正在初始化 Google Sheets 憑證...")
     try:
@@ -79,19 +81,18 @@ def get_sheets_workbook():
                 raise ValueError("GOOGLE_CREDENTIALS 格式無效，請檢查 Render 環境變數")
             creds = Credentials.from_service_account_info(creds_info, scopes=scopes)
         else:
-            logger.info("GOOGLE_CREDENTIALS 未設置，嘗試使用本地檔案 service_account.json")
-            creds = Credentials.from_service_account_file("service_account.json", scopes=scopes)
+            logger.error("GOOGLE_CREDENTIALS 未設置")
+            raise ValueError("GOOGLE_CREDENTIALS 未設置，請檢查 Render 環境變數")
         
         client = gspread.authorize(creds)
-        sheet_name = os.getenv("GOOGLE_SHEET_NAME", "記帳小浣熊資料庫")
-        logger.info(f"成功授權，正在開啟試算表：{sheet_name}")
+        logger.info(f"成功授權，嘗試開啟試算表 ID：{GOOGLE_SHEET_ID}")
         try:
-            workbook = client.open(sheet_name)
-            logger.info(f"成功開啟試算表：{sheet_name}")
+            workbook = client.open_by_key(GOOGLE_SHEET_ID)
+            logger.info(f"成功開啟試算表 ID：{GOOGLE_SHEET_ID}")
             return workbook
         except gspread.exceptions.SpreadsheetNotFound as e:
-            logger.error(f"找不到試算表 '{sheet_name}'：{e}")
-            raise ValueError(f"試算表 '{sheet_name}' 不存在或未共享給服務帳戶")
+            logger.error(f"找不到試算表 ID '{GOOGLE_SHEET_ID}'：{e}")
+            raise ValueError(f"試算表 ID '{GOOGLE_SHEET_ID}' 不存在或未共享給服務帳戶")
         except gspread.exceptions.APIError as e:
             logger.error(f"Google Sheets API 錯誤：{e}")
             raise ValueError(f"Google Sheets API 權限錯誤：{e}")
@@ -166,8 +167,33 @@ def handle_message(event):
     
     logger.info(f"Received message: '{text}' from user '{user_id}'")
 
-    reply_text = "🦝？我不太明白您的意思，請輸入「幫助」來查看指令。"
-    
+    # === 特殊處理：僅「幫助」指令不需資料庫 ===
+    if text == "幫助":
+        reply_text = (
+            "📌 **記帳小浣熊使用說明🦝**：\n\n"
+            "💸 **自然記帳** (AI會幫你分析)：\n"
+            "   - 「今天中午吃了雞排80」\n"
+            "   - 「昨天喝飲料 50」\n"
+            "   - 「上禮拜三收入 1000 獎金」\n"
+            "   - 「5/10 交通費 120」\n\n"
+            "📊 **查帳**：\n"
+            "   - 「查帳」：查看總支出、收入和淨餘額\n\n"
+            "📅 **月結**：\n"
+            "   - 「月結」：分析這個月的收支總結\n\n"
+            "🗑️ **刪除**：\n"
+            "   - 「刪除」：移除您最近一筆記錄\n\n"
+            "💡 **預算**：\n"
+            "   - 「設置預算 餐飲 3000」\n"
+            "   - 「查看預算」：檢查本月預算使用情況"
+        )
+        try:
+            line_bot_api.reply_message(reply_token, TextSendMessage(text=reply_text))
+            logger.info("Reply sent successfully for '幫助'")
+            return
+        except Exception as e:
+            logger.error(f"回覆 '幫助' 訊息失敗：{e}", exc_info=True)
+            return
+
     # === 獲取 Google Sheets 工作簿 ===
     try:
         workbook = get_sheets_workbook()
@@ -202,26 +228,7 @@ def handle_message(event):
         
     # === 指令路由器 (Router) ===
     try:
-        if text == "幫助":
-            reply_text = (
-                "📌 **記帳小浣熊使用說明🦝**：\n\n"
-                "💸 **自然記帳** (AI會幫你分析)：\n"
-                "   - 「今天中午吃了雞排80」\n"
-                "   - 「昨天喝飲料 50」\n"
-                "   - 「上禮拜三收入 1000 獎金」\n"
-                "   - 「5/10 交通費 120」\n\n"
-                "📊 **查帳**：\n"
-                "   - 「查帳」：查看總支出、收入和淨餘額\n\n"
-                "📅 **月結**：\n"
-                "   - 「月結」：分析這個月的收支總結\n\n"
-                "🗑️ **刪除**：\n"
-                "   - 「刪除」：移除您最近一筆記錄\n\n"
-                "💡 **預算**：\n"
-                "   - 「設置預算 餐飲 3000」\n"
-                "   - 「查看預算」：檢查本月預算使用情況"
-            )
-            
-        elif text == "查帳":
+        if text == "查帳":
             reply_text = handle_check_balance(trx_sheet, user_id)
             
         elif text == "月結":
