@@ -7,7 +7,7 @@ import google.generativeai as genai
 from flask import Flask, request, abort
 from linebot import WebhookHandler, LineBotApi
 from linebot.exceptions import InvalidSignatureError
-from linebot.models import MessageEvent, TextMessageContent, TextSendMessage  # 修正：新增 TextSendMessage
+from linebot.models import MessageEvent, TextMessage, TextSendMessage  # 修正：TextMessageContent -> TextMessage
 from google.oauth2.service_account import Credentials
 from datetime import datetime, timedelta
 from dotenv import load_dotenv
@@ -152,7 +152,7 @@ def webhook():
     return 'OK'
 
 # === 訊息總機 (核心邏輯) ===
-@handler.add(MessageEvent, message=TextMessageContent)
+@handler.add(MessageEvent, message=TextMessage)  # 修正：TextMessageContent -> TextMessage
 def handle_message(event):
     text = event.message.text.strip()
     reply_token = event.reply_token
