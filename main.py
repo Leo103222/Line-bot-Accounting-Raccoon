@@ -7,10 +7,14 @@ import google.generativeai as genai
 from flask import Flask, request, abort
 from linebot import WebhookHandler, LineBotApi
 from linebot.exceptions import InvalidSignatureError
-from linebot.models import MessageEvent, TextMessage, TextSendMessage  # 修正：TextMessageContent -> TextMessage
+from linebot.models import MessageEvent, TextMessage, TextSendMessage
 from google.oauth2.service_account import Credentials
 from datetime import datetime, timedelta
 from dotenv import load_dotenv
+
+# === 配置日誌 ===
+logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(name)s - %(levelname)s - %(message)s')
+logger = logging.getLogger(__name__)
 
 # === 步驟 1：載入環境變數 ===
 load_dotenv()
@@ -20,10 +24,6 @@ LINE_CHANNEL_ACCESS_TOKEN = os.getenv("LINE_CHANNEL_ACCESS_TOKEN")
 LINE_CHANNEL_SECRET = os.getenv("LINE_CHANNEL_SECRET")
 GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
 GOOGLE_SHEET_NAME = os.getenv("GOOGLE_SHEET_NAME", '記帳小浣熊資料庫')
-
-# === 配置日誌 ===
-logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(name)s - %(levelname)s - %(message)s')
-logger = logging.getLogger(__name__)
 
 # === 步驟 3：驗證金鑰是否已載入 ===
 if not all([LINE_CHANNEL_ACCESS_TOKEN, LINE_CHANNEL_SECRET, GEMINI_API_KEY]):
@@ -43,7 +43,6 @@ logger.info("Flask application initialized successfully.")
 
 # === 配置 LINE 與 Gemini API 客戶端 ===
 try:
-    # 驗證 LINE_CHANNEL_ACCESS_TOKEN 格式
     if not LINE_CHANNEL_ACCESS_TOKEN or not re.match(r'^[A-Za-z0-9+/=]+$', LINE_CHANNEL_ACCESS_TOKEN):
         logger.error("LINE_CHANNEL_ACCESS_TOKEN 格式無效，可能包含空格或無效字符")
         raise ValueError("LINE_CHANNEL_ACCESS_TOKEN 格式無效")
@@ -51,7 +50,6 @@ try:
     line_bot_api = LineBotApi(LINE_CHANNEL_ACCESS_TOKEN)
     genai.configure(api_key=GEMINI_API_KEY)
     gemini_model = genai.GenerativeModel('gemini-1.5-flash')
-    # 驗證 line_bot_api 初始化
     if not isinstance(line_bot_api, LineBotApi):
         logger.error(f"LineBotApi 初始化失敗，LINE_CHANNEL_ACCESS_TOKEN: {LINE_CHANNEL_ACCESS_TOKEN[:10]}...")
         raise ValueError("LineBotApi 初始化失敗，可能是 LINE_CHANNEL_ACCESS_TOKEN 無效")
@@ -70,33 +68,36 @@ def get_sheets_workbook():
         scopes = ["https://www.googleapis.com/auth/spreadsheets"]
         if "GOOGLE_CREDENTIALS" in os.environ:
             logger.info("使用環境變數 GOOGLE_CREDENTIALS 建立憑證。")
-            creds_info = json.loads(os.environ["GOOGLE_CREDENTIALS"])
-            logger.info(f"GOOGLE_CREDENTIALS project_id: {creds_info.get('project_id', '未找到')}")
+            creds_json = os.getenv("GOOGLE_CREDENTIALS")
+            try:
+                creds_info = json.loads(creds_json)
+                logger.info(f"GOOGLE_CREDENTIALS project_id: {creds_info.get('project_id', '未找到')}")
+                logger.info(f"GOOGLE_CREDENTIALS client_email: {creds_info.get('client_email', '未找到')}")
+            except json.JSONDecodeError as e:
+                logger.error(f"GOOGLE_CREDENTIALS JSON 解析錯誤：{e}")
+                logger.error(f"GOOGLE_CREDENTIALS 內容（前100字）：{creds_json[:100]}...")
+                raise ValueError("GOOGLE_CREDENTIALS 格式無效，請檢查 Render 環境變數")
             creds = Credentials.from_service_account_info(creds_info, scopes=scopes)
         else:
             logger.info("GOOGLE_CREDENTIALS 未設置，嘗試使用本地檔案 service_account.json")
-            creds = Credentials.from_service_account_file(
-                "service_account.json", scopes=scopes
-            )
+            creds = Credentials.from_service_account_file("service_account.json", scopes=scopes)
         
         client = gspread.authorize(creds)
         sheet_name = os.getenv("GOOGLE_SHEET_NAME", "記帳小浣熊資料庫")
         logger.info(f"成功授權，正在開啟試算表：{sheet_name}")
-        return client.open(sheet_name)
-
-    except json.JSONDecodeError as e:
-        logger.error(f"GOOGLE_CREDENTIALS JSON 格式錯誤：{e}")
-        logger.error(f"GOOGLE_CREDENTIALS 內容（前50字）：{os.getenv('GOOGLE_CREDENTIALS')[:50]}...")
-        return None
-    except FileNotFoundError:
-        logger.error("找不到 service_account.json 檔案，且未設置 GOOGLE_CREDENTIALS。")
-        return None
-    except gspread.exceptions.APIError as e:
-        logger.error(f"Google Sheets API 錯誤：{e}")
-        return None
+        try:
+            workbook = client.open(sheet_name)
+            logger.info(f"成功開啟試算表：{sheet_name}")
+            return workbook
+        except gspread.exceptions.SpreadsheetNotFound as e:
+            logger.error(f"找不到試算表 '{sheet_name}'：{e}")
+            raise ValueError(f"試算表 '{sheet_name}' 不存在或未共享給服務帳戶")
+        except gspread.exceptions.APIError as e:
+            logger.error(f"Google Sheets API 錯誤：{e}")
+            raise ValueError(f"Google Sheets API 權限錯誤：{e}")
     except Exception as e:
         logger.error(f"Google Sheets 初始化失敗：{e}", exc_info=True)
-        return None
+        raise
 
 def ensure_worksheets(workbook):
     """
@@ -105,6 +106,7 @@ def ensure_worksheets(workbook):
     try:
         try:
             trx_sheet = workbook.worksheet('Transactions')
+            logger.info("找到 Transactions 工作表")
         except gspread.exceptions.WorksheetNotFound:
             logger.info("未找到 Transactions 工作表，正在創建...")
             trx_sheet = workbook.add_worksheet(title='Transactions', rows=1000, cols=10)
@@ -113,6 +115,7 @@ def ensure_worksheets(workbook):
 
         try:
             budget_sheet = workbook.worksheet('Budgets')
+            logger.info("找到 Budgets 工作表")
         except gspread.exceptions.WorksheetNotFound:
             logger.info("未找到 Budgets 工作表，正在創建...")
             budget_sheet = workbook.add_worksheet(title='Budgets', rows=100, cols=5)
@@ -152,7 +155,7 @@ def webhook():
     return 'OK'
 
 # === 訊息總機 (核心邏輯) ===
-@handler.add(MessageEvent, message=TextMessage)  # 修正：TextMessageContent -> TextMessage
+@handler.add(MessageEvent, message=TextMessage)
 def handle_message(event):
     text = event.message.text.strip()
     reply_token = event.reply_token
@@ -166,9 +169,19 @@ def handle_message(event):
     reply_text = "🦝？我不太明白您的意思，請輸入「幫助」來查看指令。"
     
     # === 獲取 Google Sheets 工作簿 ===
-    workbook = get_sheets_workbook()
-    if not workbook:
-        reply_text = "糟糕！小浣熊的帳本(Google Sheet)連接失敗了 😵 請檢查憑證設置或 Google Sheets API 權限。"
+    try:
+        workbook = get_sheets_workbook()
+        if not workbook:
+            reply_text = "糟糕！小浣熊的帳本(Google Sheet)連接失敗了 😵 請檢查憑證設置或 Google Sheets API 權限。"
+            try:
+                line_bot_api.reply_message(reply_token, TextSendMessage(text=reply_text))
+                logger.info("Reply sent successfully")
+            except Exception as e:
+                logger.error(f"回覆訊息失敗：{e}", exc_info=True)
+            return
+    except Exception as e:
+        logger.error(f"初始化 Google Sheets 失敗：{e}", exc_info=True)
+        reply_text = f"糟糕！小浣熊的帳本連接失敗：{str(e)}"
         try:
             line_bot_api.reply_message(reply_token, TextSendMessage(text=reply_text))
             logger.info("Reply sent successfully")
@@ -229,7 +242,7 @@ def handle_message(event):
 
     except Exception as e:
         logger.error(f"處理指令 '{text}' 失敗：{e}", exc_info=True)
-        reply_text = "糟糕！小浣熊處理您的指令時出錯了 😥"
+        reply_text = f"糟糕！小浣熊處理您的指令時出錯了：{str(e)}"
 
     # === 最終回覆 ===
     if not isinstance(reply_text, str):
@@ -341,7 +354,7 @@ def handle_nlp_record(sheet, text, user_id, user_name, event_time):
         return "糟糕！AI 分析器暫時罷工了 (JSON解析失敗)... 請稍後再試。"
     except Exception as e:
         logger.error(f"Gemini API 呼叫或 GSheet 寫入失敗：{e}", exc_info=True)
-        return "目前我無法處理這個請求，請稍後再試。"
+        return f"目前我無法處理這個請求：{str(e)}"
 
 def handle_check_balance(sheet, user_id):
     logger.info(f"Handling '查帳' for user {user_id}")
@@ -378,7 +391,7 @@ def handle_check_balance(sheet, user_id):
         )
     except Exception as e:
         logger.error(f"查帳失敗：{e}", exc_info=True)
-        return "查帳失敗：無法讀取試算表。"
+        return f"查帳失敗：無法讀取試算表：{str(e)}"
 
 def handle_monthly_report(sheet, user_id, event_time):
     logger.info(f"Handling '月結' for user {user_id}")
@@ -429,7 +442,7 @@ def handle_monthly_report(sheet, user_id, event_time):
 
     except Exception as e:
         logger.error(f"月結失敗：{e}", exc_info=True)
-        return "月結報表產生失敗。"
+        return f"月結報表產生失敗：{str(e)}"
 
 def handle_delete_record(sheet, user_id):
     logger.info(f"Handling '刪除' for user {user_id}")
@@ -449,7 +462,7 @@ def handle_delete_record(sheet, user_id):
             
     except Exception as e:
         logger.error(f"刪除失敗：{e}", exc_info=True)
-        return "刪除記錄失敗。"
+        return f"刪除記錄失敗：{str(e)}"
 
 def handle_set_budget(sheet, text, user_id):
     logger.info(f"Handling '設置預算' for user {user_id}")
@@ -483,7 +496,7 @@ def handle_set_budget(sheet, text, user_id):
         
     except Exception as e:
         logger.error(f"設置預算失敗：{e}", exc_info=True)
-        return "設置預算失敗。"
+        return f"設置預算失敗：{str(e)}"
 
 def handle_view_budget(trx_sheet, budget_sheet, user_id, event_time):
     logger.info(f"Handling '查看預算' for user {user_id}")
@@ -551,7 +564,7 @@ def handle_view_budget(trx_sheet, budget_sheet, user_id, event_time):
 
     except Exception as e:
         logger.error(f"查看預算失敗：{e}", exc_info=True)
-        return "查看預算失敗。"
+        return f"查看預算失敗：{str(e)}"
 
 # === 主程式入口 ===
 if __name__ == "__main__":
