@@ -3,7 +3,7 @@ import logging
 import re
 import json
 import gspread
-import google.generativeai as genai
+from google import genai # <- 步驟 1：修改 import
 from flask import Flask, request, abort
 from linebot import WebhookHandler, LineBotApi
 from linebot.exceptions import InvalidSignatureError, LineBotApiError
@@ -44,15 +44,20 @@ else:
 app = Flask(__name__)
 logger.info("Flask application initialized successfully.")
 
-# === 配置 LINE 與 Gemini API 客戶端 ===
+# === 步驟 2：修改 Gemini API 初始化 ===
 try:
     if not LINE_CHANNEL_ACCESS_TOKEN or not re.match(r'^[A-Za-z0-9+/=]+$', LINE_CHANNEL_ACCESS_TOKEN):
         logger.error("LINE_CHANNEL_ACCESS_TOKEN 格式無效，可能包含空格或無效字符")
         raise ValueError("LINE_CHANNEL_ACCESS_TOKEN 格式無效")
     handler = WebhookHandler(LINE_CHANNEL_SECRET)
     line_bot_api = LineBotApi(LINE_CHANNEL_ACCESS_TOKEN)
-    genai.configure(api_key=GEMINI_API_KEY)
-    gemini_model = genai.GenerativeModel('gemini-1.5-flash-latest')
+    
+    # === 新的初始化方式 ===
+    gemini_client = genai.Client(api_key=GEMINI_API_KEY)
+    # 我們把要用的模型名稱存在一個變數 (推薦使用 pro 或較新模型)
+    gemini_model_name = 'gemini-1.5-pro' 
+    # ===
+    
     logger.debug("LINE 和 Gemini API 客戶端初始化成功")
 except Exception as e:
     logger.error(f"API 客戶端初始化失敗: {e}", exc_info=True)
@@ -66,12 +71,6 @@ def get_sheets_workbook():
     """
     logger.debug("正在初始化 Google Sheets 憑證...")
     try:
-        # 清理 GOOGLE_SHEET_ID，移除可能的 URL 後綴
-        sheet_id_clean = GOOGLE_SHEET_ID.split('/')[0] if '/' in GOOGLE_SHEET_ID else GOOGLE_SHEET_ID
-        if not re.match(r'^[A-Za-z0-9_-]{44}$', sheet_id_clean):
-            logger.error(f"GOOGLE_SHEET_ID 格式無效：{GOOGLE_SHEET_ID}")
-            raise ValueError(f"GOOGLE_SHEET_ID 格式無效，應為 44 位元試算表 ID（例如 1x29UGiB7OgZLT5Uv8qm-2bxjdxPjHkWhZxl7MYfSK6Q）")
-
         scopes = ["https://www.googleapis.com/auth/spreadsheets"]
         creds_json = os.getenv("GOOGLE_CREDENTIALS")
         if not creds_json:
@@ -90,18 +89,18 @@ def get_sheets_workbook():
         
         creds = Credentials.from_service_account_info(creds_info, scopes=scopes)
         client = gspread.authorize(creds)
-        logger.debug(f"成功授權，嘗試開啟試算表 ID：{sheet_id_clean}")
+        logger.debug(f"成功授權，嘗試開啟試算表 ID：{GOOGLE_SHEET_ID}")
         
         try:
-            workbook = client.open_by_key(sheet_id_clean)
-            logger.debug(f"成功開啟試算表 ID：{sheet_id_clean}")
+            workbook = client.open_by_key(GOOGLE_SHEET_ID)
+            logger.debug(f"成功開啟試算表 ID：{GOOGLE_SHEET_ID}")
             return workbook
-        except gspread.exceptions.SpreadsheetNotFound:
-            logger.error(f"找不到試算表 ID '{sheet_id_clean}'，請確認 ID 或共享權限")
-            raise ValueError(f"試算表 ID '{sheet_id_clean}' 不存在或未共享給服務帳戶")
+        except gspread.exceptions.SpreadsheetNotFound as e:
+            logger.error(f"找不到試算表 ID '{GOOGLE_SHEET_ID}'：{e}")
+            raise ValueError(f"試算表 ID '{GOOGLE_SHEET_ID}' 不存在或未共享給服務帳戶")
         except gspread.exceptions.APIError as e:
             logger.error(f"Google Sheets API 錯誤：{e}")
-            raise ValueError(f"Google Sheets API 錯誤，可能權限不足或 API 未啟用：{str(e)}")
+            raise ValueError(f"Google Sheets API 權限錯誤：{e}")
     except Exception as e:
         logger.error(f"Google Sheets 初始化失敗：{e}", exc_info=True)
         raise
@@ -252,8 +251,10 @@ def handle_message(event):
         elif text == "查看預算":
             reply_text = handle_view_budget(trx_sheet, budget_sheet, user_id, event_time)
         else:
+            # === 步驟 3：修改 handle_message 呼叫 ===
             user_name = get_user_profile_name(user_id)
-            reply_text = handle_nlp_record(trx_sheet, text, user_id, user_name, event_time)
+            # 傳入 client 和 model_name
+            reply_text = handle_nlp_record(gemini_client, gemini_model_name, trx_sheet, text, user_id, user_name, event_time)
 
     except Exception as e:
         logger.error(f"處理指令 '{text}' 失敗：{e}", exc_info=True)
@@ -271,7 +272,9 @@ def handle_message(event):
         logger.error(f"回覆訊息失敗：{e}", exc_info=True)
 
 # === 核心功能函式 (Helper Functions) ===
-def handle_nlp_record(sheet, text, user_id, user_name, event_time):
+
+# === 步驟 4：修改 handle_nlp_record 函式定義 ===
+def handle_nlp_record(client, model_name, sheet, text, user_id, user_name, event_time):
     logger.debug(f"處理自然語言記帳指令：{text}")
     today = event_time.date()
     today_str = today.strftime('%Y-%m-%d')
@@ -332,7 +335,14 @@ def handle_nlp_record(sheet, text, user_id, user_name, event_time):
     
     try:
         logger.debug("發送 prompt 至 Gemini API")
-        response = gemini_model.generate_content(prompt)
+        
+        # === 步驟 5：修改 API 呼叫 ===
+        response = client.models.generate_content(
+            model=model_name,
+            contents=prompt
+        )
+        # ===
+        
         clean_response = response.text.strip().replace("```json", "").replace("```", "")
         
         logger.debug(f"Gemini NLP response: {clean_response}")
@@ -370,6 +380,7 @@ def handle_nlp_record(sheet, text, user_id, user_name, event_time):
         return "糟糕！AI 分析器暫時罷工了 (JSON解析失敗)... 請稍後再試。"
     except Exception as e:
         logger.error(f"Gemini API 呼叫或 GSheet 寫入失敗：{e}", exc_info=True)
+        # 顯示詳細的 API 錯誤
         return f"目前我無法處理這個請求：{str(e)}"
 
 def handle_check_balance(sheet, user_id):
@@ -509,7 +520,7 @@ def handle_set_budget(sheet, text, user_id):
             return f"✅ 已設置預算：{category} {limit} 元"
     except Exception as e:
         logger.error(f"設置預算失敗：{e}", exc_info=True)
-        return f"設置預算失敗：{str(e)}"
+        return f"設置預G算失敗：{str(e)}"
 
 def handle_view_budget(trx_sheet, budget_sheet, user_id, event_time):
     logger.debug(f"處理 '查看預算' 指令，user_id: {user_id}")
