@@ -7,4 +7,4 @@ python-dotenv==1.0.1
 gunicorn==23.0.0
 pydantic==2.0.3  # 與 line-bot-sdk 3.5.0 兼容
 requests==2.31.0  # 與 line-bot-sdk 3.5.0 兼容
-aiohttp==3.10.5  # 明確指定支持 Python 3.13 的版本
+# 不明確指定 aiohttp 版本，讓 line-bot-sdk 自動處理依賴
