@@ -1,9 +1,9 @@
 flask==3.0.3
-line-bot-sdk==3.5.0
+line-bot-sdk==3.5.0  # 保持此版本，因為日誌顯示正在使用
 gspread==6.1.2
 google-auth==2.35.0
 google-generativeai==0.8.3
 python-dotenv==1.0.1
 gunicorn==23.0.0
 pydantic==1.10.13  # 鎖定 pydantic 版本
-requests==2.32.3  # 明確指定 requests 版本
+requests==2.31.0  # 與 line-bot-sdk 3.5.0 兼容
