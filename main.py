@@ -36,6 +36,7 @@ if not all([LINE_CHANNEL_ACCESS_TOKEN, LINE_CHANNEL_SECRET, GEMINI_API_KEY]):
 else:
     logger.info("所有金鑰已成功從 .env 載入。")
     logger.info(f"LINE_CHANNEL_ACCESS_TOKEN (前10字): {LINE_CHANNEL_ACCESS_TOKEN[:10]}...")
+    logger.info(f"GOOGLE_SHEET_NAME: {GOOGLE_SHEET_NAME}")
 
 # === 初始化 Flask 應用程式 ===
 app = Flask(__name__)
@@ -49,9 +50,10 @@ try:
     gemini_model = genai.GenerativeModel('gemini-1.5-flash')
     # 驗證 messaging_api 初始化
     if not isinstance(messaging_api, MessagingApi):
+        logger.error(f"MessagingApi 初始化失敗，LINE_CHANNEL_ACCESS_TOKEN: {LINE_CHANNEL_ACCESS_TOKEN[:10]}...")
         raise ValueError("MessagingApi 初始化失敗，可能是 LINE_CHANNEL_ACCESS_TOKEN 無效")
 except Exception as e:
-    logger.error(f"API 客戶端初始化失敗: {e}")
+    logger.error(f"API 客戶端初始化失敗: {e}", exc_info=True)
     raise
 
 # === Google Sheets 初始化 ===
@@ -66,6 +68,7 @@ def get_sheets_workbook():
         if "GOOGLE_CREDENTIALS" in os.environ:
             logger.info("使用環境變數 GOOGLE_CREDENTIALS 建立憑證。")
             creds_info = json.loads(os.environ["GOOGLE_CREDENTIALS"])
+            logger.info(f"GOOGLE_CREDENTIALS project_id: {creds_info.get('project_id', '未找到')}")
             creds = Credentials.from_service_account_info(creds_info, scopes=scopes)
         else:
             logger.info("GOOGLE_CREDENTIALS 未設置，嘗試使用本地檔案 service_account.json")
