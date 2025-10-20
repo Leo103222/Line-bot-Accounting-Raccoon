@@ -52,7 +52,7 @@ try:
     handler = WebhookHandler(LINE_CHANNEL_SECRET)
     line_bot_api = LineBotApi(LINE_CHANNEL_ACCESS_TOKEN)
     genai.configure(api_key=GEMINI_API_KEY)
-    gemini_model = genai.GenerativeModel('gemini-1.5-flash')
+    gemini_model = genai.GenerativeModel('gemini-1.5-flash-latest')
     logger.debug("LINE 和 Gemini API 客戶端初始化成功")
 except Exception as e:
     logger.error(f"API 客戶端初始化失敗: {e}", exc_info=True)
@@ -66,6 +66,12 @@ def get_sheets_workbook():
     """
     logger.debug("正在初始化 Google Sheets 憑證...")
     try:
+        # 清理 GOOGLE_SHEET_ID，移除可能的 URL 後綴
+        sheet_id_clean = GOOGLE_SHEET_ID.split('/')[0] if '/' in GOOGLE_SHEET_ID else GOOGLE_SHEET_ID
+        if not re.match(r'^[A-Za-z0-9_-]{44}$', sheet_id_clean):
+            logger.error(f"GOOGLE_SHEET_ID 格式無效：{GOOGLE_SHEET_ID}")
+            raise ValueError(f"GOOGLE_SHEET_ID 格式無效，應為 44 位元試算表 ID（例如 1x29UGiB7OgZLT5Uv8qm-2bxjdxPjHkWhZxl7MYfSK6Q）")
+
         scopes = ["https://www.googleapis.com/auth/spreadsheets"]
         creds_json = os.getenv("GOOGLE_CREDENTIALS")
         if not creds_json:
@@ -84,18 +90,18 @@ def get_sheets_workbook():
         
         creds = Credentials.from_service_account_info(creds_info, scopes=scopes)
         client = gspread.authorize(creds)
-        logger.debug(f"成功授權，嘗試開啟試算表 ID：{GOOGLE_SHEET_ID}")
+        logger.debug(f"成功授權，嘗試開啟試算表 ID：{sheet_id_clean}")
         
         try:
-            workbook = client.open_by_key(GOOGLE_SHEET_ID)
-            logger.debug(f"成功開啟試算表 ID：{GOOGLE_SHEET_ID}")
+            workbook = client.open_by_key(sheet_id_clean)
+            logger.debug(f"成功開啟試算表 ID：{sheet_id_clean}")
             return workbook
-        except gspread.exceptions.SpreadsheetNotFound as e:
-            logger.error(f"找不到試算表 ID '{GOOGLE_SHEET_ID}'：{e}")
-            raise ValueError(f"試算表 ID '{GOOGLE_SHEET_ID}' 不存在或未共享給服務帳戶")
+        except gspread.exceptions.SpreadsheetNotFound:
+            logger.error(f"找不到試算表 ID '{sheet_id_clean}'，請確認 ID 或共享權限")
+            raise ValueError(f"試算表 ID '{sheet_id_clean}' 不存在或未共享給服務帳戶")
         except gspread.exceptions.APIError as e:
             logger.error(f"Google Sheets API 錯誤：{e}")
-            raise ValueError(f"Google Sheets API 權限錯誤：{e}")
+            raise ValueError(f"Google Sheets API 錯誤，可能權限不足或 API 未啟用：{str(e)}")
     except Exception as e:
         logger.error(f"Google Sheets 初始化失敗：{e}", exc_info=True)
         raise
