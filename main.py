@@ -54,7 +54,7 @@ try:
     
     # === 2. 修改 Gemini API 初始化 ===
     genai.configure(api_key=GEMINI_API_KEY)
-    gemini_model = genai.GenerativeModel('gemini-pro')
+    gemini_model = genai.GenerativeModel('gemini-2.5-flash-lite')
     # ===
     
     logger.debug("LINE 和 Gemini API 客戶端初始化成功")
