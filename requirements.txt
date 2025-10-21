@@ -1,7 +1,7 @@
 flask==3.0.3
 line-bot-sdk==2.3.0
 gspread==6.1.2
-google-genai
+google-generativeai
 google-auth==2.35.0
 python-dotenv==1.0.1
 gunicorn==23.0.0
