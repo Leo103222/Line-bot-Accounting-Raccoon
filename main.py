@@ -3,7 +3,7 @@ import logging
 import re
 import json
 import gspread
-import google.generativeai as genai
+from google import genai # <- 1. 修改 import
 from flask import Flask, request, abort
 from linebot import WebhookHandler, LineBotApi
 from linebot.exceptions import InvalidSignatureError, LineBotApiError
@@ -51,8 +51,14 @@ try:
         raise ValueError("LINE_CHANNEL_ACCESS_TOKEN 格式無效")
     handler = WebhookHandler(LINE_CHANNEL_SECRET)
     line_bot_api = LineBotApi(LINE_CHANNEL_ACCESS_TOKEN)
-    genai.configure(api_key=GEMINI_API_KEY)
-    gemini_model = genai.GenerativeModel('gemini-1.5-flash-latest') # 更新模型名稱
+    
+    # === 2. 修改 Gemini API 初始化 ===
+    # genai.configure(api_key=GEMINI_API_KEY) # 舊的
+    # gemini_model = genai.GenerativeModel('gemini-1.5-flash') # 舊的
+    gemini_client = genai.Client(api_key=GEMINI_API_KEY)
+    gemini_model_name = 'gemini-1.5-pro' # 使用 Pro 或更新的模型
+    # ===
+    
     logger.debug("LINE 和 Gemini API 客戶端初始化成功")
 except Exception as e:
     logger.error(f"API 客戶端初始化失敗: {e}", exc_info=True)
@@ -247,7 +253,9 @@ def handle_message(event):
             reply_text = handle_view_budget(trx_sheet, budget_sheet, user_id, event_time)
         else:
             user_name = get_user_profile_name(user_id)
-            reply_text = handle_nlp_record(trx_sheet, text, user_id, user_name, event_time)
+            # === 3. 修改 handle_message 呼叫 ===
+            # reply_text = handle_nlp_record(trx_sheet, text, user_id, user_name, event_time) # 舊的
+            reply_text = handle_nlp_record(gemini_client, gemini_model_name, trx_sheet, text, user_id, user_name, event_time) # 新的
 
     except Exception as e:
         logger.error(f"處理指令 '{text}' 失敗：{e}", exc_info=True)
@@ -265,7 +273,10 @@ def handle_message(event):
         logger.error(f"回覆訊息失敗：{e}", exc_info=True)
 
 # === 核心功能函式 (Helper Functions) ===
-def handle_nlp_record(sheet, text, user_id, user_name, event_time):
+
+# === 4. 修改 handle_nlp_record 函式定義 ===
+# def handle_nlp_record(sheet, text, user_id, user_name, event_time): # 舊的
+def handle_nlp_record(client, model_name, sheet, text, user_id, user_name, event_time): # 新的
     logger.debug(f"處理自然語言記帳指令：{text}")
     today = event_time.date()
     today_str = today.strftime('%Y-%m-%d')
@@ -326,7 +337,15 @@ def handle_nlp_record(sheet, text, user_id, user_name, event_time):
     
     try:
         logger.debug("發送 prompt 至 Gemini API")
-        response = gemini_model.generate_content(prompt)
+        
+        # === 5. 修改 API 呼叫 ===
+        # response = gemini_model.generate_content(prompt) # 舊的
+        response = client.models.generate_content( # 新的
+            model=model_name,
+            contents=prompt
+        )
+        # ===
+        
         clean_response = response.text.strip().replace("```json", "").replace("```", "")
         
         logger.debug(f"Gemini NLP response: {clean_response}")
