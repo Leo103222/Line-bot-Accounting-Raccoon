@@ -164,6 +164,7 @@ def webhook():
     return 'OK'
 
 # === 訊息總機 (核心邏輯) ===
+# ***** 這裡有修改 *****
 @handler.add(MessageEvent, message=TextMessage)
 def handle_message(event):
     text = event.message.text.strip()
@@ -252,7 +253,9 @@ def handle_message(event):
         else:
             user_name = get_user_profile_name(user_id)
             # === 3. 修改 handle_message 呼叫 ===
-            reply_text = handle_nlp_record(trx_sheet, text, user_id, user_name, event_time)
+            # ***** 這裡有修改 *****
+            # 我們需要把 budget_sheet 也傳下去，才能做預算警告
+            reply_text = handle_nlp_record(trx_sheet, budget_sheet, text, user_id, user_name, event_time)
 
     except Exception as e:
         logger.error(f"處理指令 '{text}' 失敗：{e}", exc_info=True)
@@ -271,8 +274,83 @@ def handle_message(event):
 
 # === 核心功能函式 (Helper Functions) ===
 
+# ***** 這裡新增了 'get_cute_reply' 函式 *****
+def get_cute_reply(category):
+    """
+    根據類別返回客製化的可愛回應
+    """
+    replies = {
+        "餐飲": "好好吃飯，才有力氣！ 🍜 (⁎⁍̴̛ᴗ⁍̴̛⁎)",
+        "飲料": "是全糖嗎？ 🧋 快樂水 get daze！",
+        "交通": "嗶嗶！出門平安 🚗 目的地就在前方！",
+        "娛樂": "哇！聽起來好好玩！ 🎮 (≧▽≦)",
+        "購物": "又要拆包裹啦！📦 快樂就是這麼樸實無華！",
+        "雜項": "嗯... 這筆花費有點神秘喔 🧐",
+        "收入": "太棒了！💰 距離財富自由又近了一步！"
+    }
+    # 如果找不到類別，就回傳一個通用的
+    return replies.get(category, "✅ 記錄完成！")
+
+# ***** 這裡新增了 'check_budget_warning' 函式 *****
+def check_budget_warning(trx_sheet, budget_sheet, user_id, category, event_time):
+    """
+    檢查特定類別的預算，如果接近或超過則回傳警告訊息
+    """
+    # 收入不需要檢查預算
+    if category == "收入":
+        return ""
+
+    logger.debug(f"正在為 {user_id} 檢查 {category} 的預算...")
+    try:
+        # 1. 找到這個類別的預算
+        budgets_records = budget_sheet.get_all_records()
+        user_budget_limit = 0.0
+        for b in budgets_records:
+            if b.get('使用者ID') == user_id and b.get('類別') == category:
+                user_budget_limit = float(b.get('限額', 0))
+                break
+        
+        # 如果沒有設定這個類別的預算，或預算為 0，就不用警告
+        if user_budget_limit <= 0:
+            logger.debug(f"使用者 {user_id} 未設定 {category} 預算，跳過警告。")
+            return ""
+
+        # 2. 計算這個類別的本月總花費
+        transactions_records = trx_sheet.get_all_records()
+        current_month_str = event_time.strftime('%Y-%m')
+        spent = 0.0
+        for r in transactions_records:
+            try:
+                amount = float(r.get('金額', 0))
+                if (r.get('使用者ID') == user_id and
+                    r.get('日期', '').startswith(current_month_str) and
+                    r.get('類別') == category and
+                    amount < 0): # 確保是支出
+                    spent += abs(amount)
+            except (ValueError, TypeError):
+                continue
+        
+        logger.debug(f"{category} 預算 {user_budget_limit}, 本月已花 {spent}")
+        
+        # 3. 判斷是否警告
+        percentage = (spent / user_budget_limit) * 100
+        
+        if percentage >= 100:
+            return f"\n\n🚨 警告！ {category} 預算已超支 {spent - user_budget_limit} 元！ 😱"
+        elif percentage >= 90:
+            remaining = user_budget_limit - spent
+            return f"\n\n🔔 注意！ {category} 預算只剩下 {remaining} 元囉！ (已用 {percentage:.0f}%)"
+        
+        return "" # 還在安全範圍
+    
+    except Exception as e:
+        logger.error(f"檢查預算警告失敗：{e}", exc_info=True)
+        # 即使檢查失敗，也不該讓主程式崩潰
+        return "\n(檢查預算時發生錯誤)"
+
+
 # === 4. 修改 handle_nlp_record 函式定義 ===
-def handle_nlp_record(sheet, text, user_id, user_name, event_time):
+def handle_nlp_record(sheet, budget_sheet, text, user_id, user_name, event_time):
     logger.debug(f"處理自然語言記帳指令：{text}")
     today = event_time.date()
     today_str = today.strftime('%Y-%m-%d')
@@ -334,7 +412,7 @@ def handle_nlp_record(sheet, text, user_id, user_name, event_time):
     try:
         logger.debug("發送 prompt 至 Gemini API")
         
-        # === 5. 修改 API 呼叫 ===
+        # === 5.  API 呼叫 ===
         response = gemini_model.generate_content(prompt)
         # ===
         
@@ -356,20 +434,35 @@ def handle_nlp_record(sheet, text, user_id, user_name, event_time):
             if amount == 0:
                 return "🦝？ 金額不能是 0 喔！"
 
+            # 寫入 GSheet
             sheet.append_row([date, category, amount, user_id, user_name, notes])
             logger.debug("成功寫入 Google Sheet 記錄")
+                        
+            # 1. 獲取可愛回應
+            cute_reply = get_cute_reply(category)
             
+            # 2. 檢查預算警告
+            warning_message = check_budget_warning(sheet, budget_sheet, user_id, category, event_time)
+            
+            # 3. 計算總餘額 (這段邏輯你原本就有了)
             all_records = sheet.get_all_records()
             user_balance = 0.0
             for r in all_records:
                 if r.get('使用者ID') == user_id:
                     try:
-                        amount = float(r.get('金額', 0))
-                        user_balance += amount
+                        amount_val = float(r.get('金額', 0)) # 避免變數名稱衝突
+                        user_balance += amount_val
                     except (ValueError, TypeError):
                         continue
-
-            return f"✅ 已記錄：{date}\n{notes} ({category}) {abs(amount)} 元\n📈 {user_name} 的目前總餘額：{user_balance} 元"
+            
+            # 4. 組合最終回覆
+            #    把原本的回覆 (✅ 已記錄...) 換成新的組合
+            return (
+                f"{cute_reply}\n\n"
+                f"📝 摘要：{date} {notes} ({category}) {abs(amount)} 元\n"
+                f"📈 {user_name} 目前總餘額：{user_balance} 元"
+                f"{warning_message}" # 這個字串本身就包含 \n\n (如果有的話)
+            )
 
         elif status == 'chat':
             return message or "你好！我是記帳小浣熊 🦝"
