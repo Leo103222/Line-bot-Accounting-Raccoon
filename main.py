@@ -193,6 +193,7 @@ def handle_message(event):
             "💡 **預算**：\n"
             "   - 「設置預算 餐飲 3000」\n"
             "   - 「查看預算」：檢查本月預算使用情況"
+            " 類別: 🍽️ 餐飲 🥤 飲料 🚌 交通 🎬 娛樂 🛍️ 購物 💡 雜項💰 收入"
         )
         logger.debug("處理 '幫助' 指令，準備回覆")
         try:
@@ -253,8 +254,6 @@ def handle_message(event):
         else:
             user_name = get_user_profile_name(user_id)
             # === 3. 修改 handle_message 呼叫 ===
-            # ***** 這裡有修改 *****
-            # 我們需要把 budget_sheet 也傳下去，才能做預算警告
             reply_text = handle_nlp_record(trx_sheet, budget_sheet, text, user_id, user_name, event_time)
 
     except Exception as e:
