@@ -347,11 +347,9 @@ def check_budget_warning(trx_sheet, budget_sheet, user_id, category, event_time)
         percentage = (spent / user_budget_limit) * 100
         
         if percentage >= 100:
-            # 修改：格式化為 .0f (無小數點)
             return f"\n\n🚨 警告！ {category} 預算已超支 {spent - user_budget_limit:.0f} 元！ 😱"
         elif percentage >= 90:
             remaining = user_budget_limit - spent
-            # 修改：格式化為 .0f (無小數點)
             return f"\n\n🔔 注意！ {category} 預算只剩下 {remaining:.0f} 元囉！ (已用 {percentage:.0f}%)"
         
         return "" # 還在安全範圍
@@ -408,7 +406,7 @@ def handle_nlp_record(sheet, budget_sheet, text, user_id, user_name, event_time)
     2. 如果使用者只是在閒聊 (例如 "你好", "你是誰", "謝謝")：
         - status: "chat"
         - data: null
-        - message: (請用「記帳小浣熊🦝」的語氣友善回覆)
+        - message: (請用「記帳小浣熊🦝」的語氣友善回覆 )
     3. 如果看起來像記帳，但缺少關鍵資訊 (例如 "我吃了東西" 或 "雞排" (沒說金額))：
         - status: "failure"
         - data: null
@@ -609,7 +607,7 @@ def handle_set_budget(sheet, text, user_id):
         return "格式錯誤！請輸入「設置預算 [類別] [限額]」，例如：「設置預算 餐飲 3000」"
     
     category = match.group(1).strip()
-    limit = int(match.group(2)) # 這裡已是 int，不需修改
+    limit = int(match.group(2)) 
     
     valid_categories = ['餐飲', '飲料', '交通', '娛樂', '購物', '雜項']
     if category not in valid_categories:
@@ -627,10 +625,10 @@ def handle_set_budget(sheet, text, user_id):
         
         if found_row != -1:
             sheet.update_cell(found_row, 3, limit)
-            return f"✅ 已更新預算：{category} {limit} 元" # limit 已是 int
+            return f"✅ 已更新預算：{category} {limit} 元" 
         else:
             sheet.append_row([user_id, category, limit])
-            return f"✅ 已設置預算：{category} {limit} 元" # limit 已是 int
+            return f"✅ 已設置預算：{category} {limit} 元" 
     except Exception as e:
         logger.error(f"設置預算失敗：{e}", exc_info=True)
         return f"設置預算失敗：{str(e)}"
@@ -680,8 +678,6 @@ def handle_view_budget(trx_sheet, budget_sheet, user_id, event_time):
                 bar_empty = ''
                  
             status_icon = "🟢" if remaining >= 0 else "🔴"
-
-            # 修改：格式化 limit, spent, remaining 為 .0f (無小數點)
             reply += f"\n{category} (限額 {limit:.0f} 元)\n"
             reply += f"   {status_icon} 已花費：{spent:.0f} 元\n"
             reply += f"   [{bar_fill}{bar_empty}] {percentage:.0f}%\n"
@@ -693,7 +689,6 @@ def handle_view_budget(trx_sheet, budget_sheet, user_id, event_time):
             total_percentage = (total_spent / total_limit) * 100
             status_icon = "🟢" if total_remaining >= 0 else "🔴"
             
-            # 修改：格式化 total_limit, total_spent, total_remaining 為 .0f (無小數點)
             reply += f"總預算： {total_limit:.0f} 元\n"
             reply += f"總花費： {total_spent:.0f} 元\n"
             reply += f"{status_icon} 總剩餘：{total_remaining:.0f} 元 ({total_percentage:.0f}%)"
