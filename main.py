@@ -164,7 +164,6 @@ def webhook():
     return 'OK'
 
 # === 訊息總機 (核心邏輯) ===
-# ***** 這裡有修改 *****
 @handler.add(MessageEvent, message=TextMessage)
 def handle_message(event):
     text = event.message.text.strip()
@@ -177,6 +176,7 @@ def handle_message(event):
     
     # === 特殊處理：僅「幫助」指令不需資料庫 ===
     if text == "幫助":
+        # === 修改：步驟一，新增「查詢」說明 ===
         reply_text = (
             "📌 **記帳小浣熊使用說明🦝**：\n\n"
             "💸 **自然記帳** (AI會幫你分析)：\n"
@@ -186,15 +186,20 @@ def handle_message(event):
             "   - 「5/10 交通費 120」\n\n"
             "📊 **查帳**：\n"
             "   - 「查帳」：查看總支出、收入和淨餘額\n\n"
+            "🔎 **查詢**：\n"
+            "   - 「查詢 [關鍵字]」：搜尋相關記錄\n"
+            "     (例如: 查詢 雞排)\n\n"
             "📅 **月結**：\n"
             "   - 「月結」：分析這個月的收支總結\n\n"
             "🗑️ **刪除**：\n"
             "   - 「刪除」：移除您最近一筆記錄\n\n"
             "💡 **預算**：\n"
             "   - 「設置預算 餐飲 3000」\n"
-            "   - 「查看預算」：檢查本月預算使用情況"
+            "   - 「查看預算」：檢查本月預算使用情況\n"
             " 類別: 🍽️ 餐飲 🥤 飲料 🚌 交通 🎬 娛樂 🛍️ 購物 💡 雜項💰 收入"
         )
+        # === 修改結束 ===
+        
         logger.debug("處理 '幫助' 指令，準備回覆")
         try:
             line_bot_api.reply_message(reply_token, TextSendMessage(text=reply_text))
@@ -251,9 +256,18 @@ def handle_message(event):
             reply_text = handle_set_budget(budget_sheet, text, user_id)
         elif text == "查看預算":
             reply_text = handle_view_budget(trx_sheet, budget_sheet, user_id, event_time)
+        
+        # === 新增：步驟二，加入「查詢」路由 ===
+        elif text.startswith("查詢"):
+            keyword = text[2:].strip() # 取得「查詢」後面的所有文字並去除空白
+            if not keyword:
+                reply_text = "請輸入您想查詢的關鍵字喔！\n例如：「查詢 雞排」"
+            else:
+                reply_text = handle_search_records(trx_sheet, user_id, keyword)
+        # === 新增結束 ===
+                
         else:
             user_name = get_user_profile_name(user_id)
-            # === 3. 修改 handle_message 呼叫 ===
             reply_text = handle_nlp_record(trx_sheet, budget_sheet, text, user_id, user_name, event_time)
 
     except Exception as e:
@@ -273,7 +287,6 @@ def handle_message(event):
 
 # === 核心功能函式 (Helper Functions) ===
 
-# ***** 這裡新增了 'get_cute_reply' 函式 *****
 def get_cute_reply(category):
     """
     根據類別返回客製化的可愛回應
@@ -290,7 +303,6 @@ def get_cute_reply(category):
     # 如果找不到類別，就回傳一個通用的
     return replies.get(category, "✅ 記錄完成！")
 
-# ***** 這裡新增了 'check_budget_warning' 函式 *****
 def check_budget_warning(trx_sheet, budget_sheet, user_id, category, event_time):
     """
     檢查特定類別的預算，如果接近或超過則回傳警告訊息
@@ -349,8 +361,6 @@ def check_budget_warning(trx_sheet, budget_sheet, user_id, category, event_time)
         # 即使檢查失敗，也不該讓主程式崩潰
         return "\n(檢查預算時發生錯誤)"
 
-
-# === 4. 修改 handle_nlp_record 函式定義 ===
 def handle_nlp_record(sheet, budget_sheet, text, user_id, user_name, event_time):
     logger.debug(f"處理自然語言記帳指令：{text}")
     today = event_time.date()
@@ -413,9 +423,7 @@ def handle_nlp_record(sheet, budget_sheet, text, user_id, user_name, event_time)
     try:
         logger.debug("發送 prompt 至 Gemini API")
         
-        # === 5.  API 呼叫 ===
         response = gemini_model.generate_content(prompt)
-        # ===
         
         clean_response = response.text.strip().replace("```json", "").replace("```", "")
         
@@ -696,6 +704,72 @@ def handle_view_budget(trx_sheet, budget_sheet, user_id, event_time):
     except Exception as e:
         logger.error(f"查看預算失敗：{e}", exc_info=True)
         return f"查看預算失敗：{str(e)}"
+
+# === 新增：步驟三，加入「查詢」核心函式 ===
+def handle_search_records(sheet, user_id, keyword):
+    """
+    處理關鍵字查詢
+    """
+    logger.debug(f"處理 '查詢' 指令，user_id: {user_id}, keyword: {keyword}")
+    try:
+        records = sheet.get_all_records()
+        matches = []
+        
+        # 篩選符合 user_id 和 keyword 的記錄
+        for r in records:
+            if r.get('使用者ID') == user_id:
+                # 檢查「類別」或「備註」欄位是否包含關鍵字
+                if keyword in r.get('類別', '') or keyword in r.get('備註', ''):
+                    matches.append(r)
+        
+        if not matches:
+            return f"🦝 找不到關於「{keyword}」的任何記錄喔！"
+        
+        # 格式化回覆訊息
+        reply = f"🔎 關鍵字「{keyword}」的搜尋結果 (共 {len(matches)} 筆)：\n\n"
+        total_amount = 0.0
+        limit = 15 # 最多顯示 15 筆，避免訊息過長
+        
+        # 為了排序，我們先處理所有匹配的記錄
+        sorted_matches = sorted(matches, key=lambda x: x.get('日期', ''), reverse=True)
+        
+        for r in sorted_matches[:limit]:
+            try:
+                date = r.get('日期', 'N/A')
+                category = r.get('類別', 'N/A')
+                notes = r.get('備註', 'N/A')
+                amount = float(r.get('金額', 0))
+                
+                total_amount += amount # 計算前 limit 筆的總和 (或所有?) 
+                                    # 這裡改為計算所有匹配的總和
+                
+                # 格式化單筆記錄
+                reply += f"• {date} {notes} ({category}) {amount:.0f} 元\n"
+                
+            except (ValueError, TypeError):
+                continue
+        
+        # 計算所有匹配項的總和 (而不是只有前15筆)
+        total_amount_all_matches = 0.0
+        for r in matches:
+             try:
+                total_amount_all_matches += float(r.get('金額', 0))
+             except (ValueError, TypeError):
+                continue
+        
+        reply += f"\n--------------------\n"
+        reply += f"📈 查詢總計：{total_amount_all_matches:.0f} 元\n"
+        
+        if len(matches) > limit:
+            reply += f"(只顯示最近 {limit} 筆記錄)"
+            
+        return reply
+        
+    except Exception as e:
+        logger.error(f"查詢記錄失敗：{e}", exc_info=True)
+        return f"查詢失敗：{str(e)}"
+# === 新增結束 ===
+
 
 # === 主程式入口 ===
 if __name__ == "__main__":
