@@ -4,6 +4,7 @@ import re
 import json
 import gspread
 import google.generativeai as genai
+import random
 from flask import Flask, request, abort
 from linebot import WebhookHandler, LineBotApi
 from linebot.exceptions import InvalidSignatureError, LineBotApiError
@@ -29,16 +30,9 @@ GOOGLE_SHEET_ID = os.getenv("GOOGLE_SHEET_ID")
 # === 步驟 3：驗證金鑰是否已載入 ===
 if not all([LINE_CHANNEL_ACCESS_TOKEN, LINE_CHANNEL_SECRET, GEMINI_API_KEY, GOOGLE_SHEET_ID]):
     logger.error("!!! 關鍵金鑰載入失敗 !!!")
-    logger.error("請檢查：")
-    logger.error("1. 專案資料夾中是否有 .env 檔案？")
-    logger.error("2. .env 檔案中是否正確填寫了 LINE_..., GEMINI_..., GOOGLE_SHEET_ID？")
     raise ValueError("金鑰未配置，請檢查 .env 檔案")
 else:
     logger.debug("所有金鑰已成功從 .env 載入。")
-    logger.debug(f"LINE_CHANNEL_ACCESS_TOKEN (前10字): {LINE_CHANNEL_ACCESS_TOKEN[:10] if LINE_CHANNEL_ACCESS_TOKEN else '未設置'}...")
-    logger.debug(f"LINE_CHANNEL_SECRET (前10字): {LINE_CHANNEL_SECRET[:10] if LINE_CHANNEL_SECRET else '未設置'}...")
-    logger.debug(f"GOOGLE_SHEET_NAME: {GOOGLE_SHEET_NAME}")
-    logger.debug(f"GOOGLE_SHEET_ID: {GOOGLE_SHEET_ID}")
 
 # === 初始化 Flask 應用程式 ===
 app = Flask(__name__)
@@ -47,15 +41,13 @@ logger.info("Flask application initialized successfully.")
 # === 配置 LINE 與 Gemini API 客戶端 ===
 try:
     if not LINE_CHANNEL_ACCESS_TOKEN or not re.match(r'^[A-Za-z0-9+/=]+$', LINE_CHANNEL_ACCESS_TOKEN):
-        logger.error("LINE_CHANNEL_ACCESS_TOKEN 格式無效，可能包含空格或無效字符")
+        logger.error("LINE_CHANNEL_ACCESS_TOKEN 格式無效")
         raise ValueError("LINE_CHANNEL_ACCESS_TOKEN 格式無效")
     handler = WebhookHandler(LINE_CHANNEL_SECRET)
     line_bot_api = LineBotApi(LINE_CHANNEL_ACCESS_TOKEN)
     
-    # === 2. 修改 Gemini API 初始化 ===
     genai.configure(api_key=GEMINI_API_KEY)
     gemini_model = genai.GenerativeModel('gemini-2.5-flash-lite')
-    # ===
     
     logger.debug("LINE 和 Gemini API 客戶端初始化成功")
 except Exception as e:
@@ -66,7 +58,6 @@ except Exception as e:
 def get_sheets_workbook():
     """
     初始化 Google Sheets 客戶端並返回工作簿 (Workbook) 物件
-    使用 GOOGLE_SHEET_ID 存取試算表
     """
     logger.debug("正在初始化 Google Sheets 憑證...")
     try:
@@ -76,57 +67,38 @@ def get_sheets_workbook():
             logger.error("GOOGLE_CREDENTIALS 未設置或為空")
             raise ValueError("GOOGLE_CREDENTIALS 未設置或為空")
         
-        logger.debug(f"GOOGLE_CREDENTIALS 內容（前100字）：{creds_json[:100]}...")
-        try:
-            creds_info = json.loads(creds_json)
-            logger.debug(f"GOOGLE_CREDENTIALS project_id: {creds_info.get('project_id', '未找到')}")
-            logger.debug(f"GOOGLE_CREDENTIALS client_email: {creds_info.get('client_email', '未找到')}")
-        except json.JSONDecodeError as e:
-            logger.error(f"GOOGLE_CREDENTIALS JSON 解析錯誤：{e}")
-            logger.error(f"GOOGLE_CREDENTIALS 內容（前100字）：{creds_json[:100]}...")
-            raise ValueError(f"GOOGLE_CREDENTIALS 格式無效：{str(e)}")
-        
+        creds_info = json.loads(creds_json)
         creds = Credentials.from_service_account_info(creds_info, scopes=scopes)
         client = gspread.authorize(creds)
-        logger.debug(f"成功授權，嘗試開啟試算表 ID：{GOOGLE_SHEET_ID}")
         
-        try:
-            workbook = client.open_by_key(GOOGLE_SHEET_ID)
-            logger.debug(f"成功開啟試算表 ID：{GOOGLE_SHEET_ID}")
-            return workbook
-        except gspread.exceptions.SpreadsheetNotFound as e:
-            logger.error(f"找不到試算表 ID '{GOOGLE_SHEET_ID}'：{e}")
-            raise ValueError(f"試算表 ID '{GOOGLE_SHEET_ID}' 不存在或未共享給服務帳戶")
-        except gspread.exceptions.APIError as e:
-            logger.error(f"Google Sheets API 錯誤：{e}")
-            raise ValueError(f"Google Sheets API 權限錯誤：{e}")
+        logger.debug(f"成功授權，嘗試開啟試算表 ID：{GOOGLE_SHEET_ID}")
+        workbook = client.open_by_key(GOOGLE_SHEET_ID)
+        return workbook
+        
     except Exception as e:
         logger.error(f"Google Sheets 初始化失敗：{e}", exc_info=True)
         raise
 
 def ensure_worksheets(workbook):
     """
-    確保 Google Sheet 中存在 Transactions 和 Budgets 工作表，若不存在則創建
+    確保 Google Sheet 中存在 Transactions 和 Budgets 工作表
     """
     logger.debug("檢查並確保 Transactions 和 Budgets 工作表存在...")
     try:
         try:
             trx_sheet = workbook.worksheet('Transactions')
-            logger.debug("找到 Transactions 工作表")
         except gspread.exceptions.WorksheetNotFound:
             logger.debug("未找到 Transactions 工作表，正在創建...")
             trx_sheet = workbook.add_worksheet(title='Transactions', rows=1000, cols=10)
-            trx_sheet.append_row(['日期', '類別', '金額', '使用者ID', '使用者名稱', '備註'])
-            logger.debug("Transactions 工作表創建成功")
+            # 修改欄位名稱：日期 -> 時間
+            trx_sheet.append_row(['時間', '類別', '金額', '使用者ID', '使用者名稱', '備註'])
 
         try:
             budget_sheet = workbook.worksheet('Budgets')
-            logger.debug("找到 Budgets 工作表")
         except gspread.exceptions.WorksheetNotFound:
             logger.debug("未找到 Budgets 工作表，正在創建...")
             budget_sheet = workbook.add_worksheet(title='Budgets', rows=100, cols=5)
             budget_sheet.append_row(['使用者ID', '類別', '限額'])
-            logger.debug("Budgets 工作表創建成功")
 
         return trx_sheet, budget_sheet
     except Exception as e:
@@ -134,10 +106,12 @@ def ensure_worksheets(workbook):
         return None, None
 
 def get_user_profile_name(user_id):
+    """
+    透過 LINE API 獲取使用者名稱
+    """
     logger.debug(f"獲取使用者 {user_id} 的個人資料...")
     try:
         profile = line_bot_api.get_profile(user_id)
-        logger.debug(f"成功獲取使用者 {user_id} 的顯示名稱：{profile.display_name}")
         return profile.display_name
     except LineBotApiError as e:
         logger.error(f"無法獲取使用者 {user_id} 的個人資料：{e}", exc_info=True)
@@ -149,11 +123,9 @@ def webhook():
     signature = request.headers.get('X-Line-Signature', '')
     body = request.get_data(as_text=True)
     logger.debug(f"Received webhook request, body (前100字): {body[:100]}...")
-    logger.debug(f"X-Line-Signature: {signature}")
     
     try:
         handler.handle(body, signature)
-        logger.debug("Webhook 處理成功")
     except InvalidSignatureError as e:
         logger.error(f"Invalid signature: {e}. Check LINE_CHANNEL_SECRET.", exc_info=True)
         abort(400)
@@ -174,21 +146,22 @@ def handle_message(event):
     
     logger.debug(f"Received message: '{text}' from user '{user_id}' at {event_time}")
     
-    # === 特殊處理：僅「幫助」指令不需資料庫 ===
+    # 特殊處理：「幫助」指令不需資料庫
     if text == "幫助":
-        # === 修改：步驟一，新增「查詢」說明 ===
         reply_text = (
             "📌 **記帳小浣熊使用說明🦝**：\n\n"
             "💸 **自然記帳** (AI會幫你分析)：\n"
             "   - 「今天中午吃了雞排80」\n"
             "   - 「昨天喝飲料 50」\n"
             "   - 「上禮拜三收入 1000 獎金」\n"
-            "   - 「5/10 交通費 120」\n\n"
+            "   - 「5/10 交通費 120」\n"
+            "   - 「午餐100 晚餐200」 (支援多筆)\n\n"
             "📊 **查帳**：\n"
             "   - 「查帳」：查看總支出、收入和淨餘額\n\n"
             "🔎 **查詢**：\n"
-            "   - 「查詢 [關鍵字]」：搜尋相關記錄\n"
-            "     (例如: 查詢 雞排)\n\n"
+            "   - 「查詢 雞排」\n"
+            "   - 「查詢 這禮拜的餐飲」\n"
+            "   - 「查詢 10/1~10/10 的收入」\n\n"
             "📅 **月結**：\n"
             "   - 「月結」：分析這個月的收支總結\n\n"
             "🗑️ **刪除**：\n"
@@ -198,53 +171,39 @@ def handle_message(event):
             "   - 「查看預算」：檢查本月預算使用情況\n"
             " 類別: 🍽️ 餐飲 🥤 飲料 🚌 交通 🎬 娛樂 🛍️ 購物 💡 雜項💰 收入"
         )
-        # === 修改結束 ===
         
-        logger.debug("處理 '幫助' 指令，準備回覆")
         try:
             line_bot_api.reply_message(reply_token, TextSendMessage(text=reply_text))
-            logger.debug("成功回覆 '幫助' 指令")
             return
         except LineBotApiError as e:
             logger.error(f"回覆 '幫助' 訊息失敗：{e}", exc_info=True)
             return
 
-    # === 獲取 Google Sheets 工作簿 ===
-    logger.debug("嘗試初始化 Google Sheets 工作簿")
+    # 獲取 Google Sheets 工作簿
     try:
         workbook = get_sheets_workbook()
         if not workbook:
-            logger.error("Google Sheets 工作簿為 None")
-            reply_text = "糟糕！小浣熊的帳本(Google Sheet)連接失敗了 😵 請檢查憑證設置或 Google Sheets API 權限。"
-            try:
-                line_bot_api.reply_message(reply_token, TextSendMessage(text=reply_text))
-                logger.debug("成功回覆 Google Sheets 初始化失敗訊息")
-            except LineBotApiError as e:
-                logger.error(f"回覆 Google Sheets 失敗訊息時出錯：{e}", exc_info=True)
-            return
+            raise ValueError("Google Sheets 工作簿為 None")
     except Exception as e:
         logger.error(f"初始化 Google Sheets 失敗：{e}", exc_info=True)
         reply_text = f"糟糕！小浣熊的帳本連接失敗：{str(e)}"
         try:
             line_bot_api.reply_message(reply_token, TextSendMessage(text=reply_text))
-            logger.debug("成功回覆 Google Sheets 初始化錯誤訊息")
-        except LineBotApiError as e:
-            logger.error(f"回覆 Google Sheets 錯誤訊息失敗：{e}", exc_info=True)
+        except LineBotApiError as e_reply:
+            logger.error(f"回覆 Google Sheets 錯誤訊息失敗：{e_reply}", exc_info=True)
         return
 
-    # === 確保工作表存在 ===
-    logger.debug("檢查 Google Sheets 工作表")
+    # 確保工作表存在
     trx_sheet, budget_sheet = ensure_worksheets(workbook)
     if not trx_sheet or not budget_sheet:
-        reply_text = "糟糕！無法創建或存取 'Transactions' 或 'Budgets' 工作表，請檢查 Google Sheet 設定。"
+        reply_text = "糟糕！無法創建或存取 'Transactions' 或 'Budgets' 工作表。"
         try:
             line_bot_api.reply_message(reply_token, TextSendMessage(text=reply_text))
-            logger.debug("成功回覆工作表錯誤訊息")
         except LineBotApiError as e:
             logger.error(f"回覆工作表錯誤訊息失敗：{e}", exc_info=True)
         return
         
-    # === 指令路由器 (Router) ===
+    # 指令路由器 (Router)
     try:
         if text == "查帳":
             reply_text = handle_check_balance(trx_sheet, user_id)
@@ -256,17 +215,14 @@ def handle_message(event):
             reply_text = handle_set_budget(budget_sheet, text, user_id)
         elif text == "查看預算":
             reply_text = handle_view_budget(trx_sheet, budget_sheet, user_id, event_time)
-        
-        # === 新增：步驟二，加入「查詢」路由 ===
         elif text.startswith("查詢"):
-            keyword = text[2:].strip() # 取得「查詢」後面的所有文字並去除空白
+            keyword = text[2:].strip()
             if not keyword:
-                reply_text = "請輸入您想查詢的關鍵字喔！\n例如：「查詢 雞排」"
+                reply_text = "請輸入您想查詢的關鍵字喔！\n例如：「查詢 雞排」或「查詢 這禮拜」"
             else:
-                reply_text = handle_search_records(trx_sheet, user_id, keyword)
-        # === 新增結束 ===
-                
+                reply_text = handle_search_records(trx_sheet, user_id, keyword, event_time)
         else:
+            # 預設執行 NLP 自然語言記帳
             user_name = get_user_profile_name(user_id)
             reply_text = handle_nlp_record(trx_sheet, budget_sheet, text, user_id, user_name, event_time)
 
@@ -274,14 +230,12 @@ def handle_message(event):
         logger.error(f"處理指令 '{text}' 失敗：{e}", exc_info=True)
         reply_text = f"糟糕！小浣熊處理您的指令時出錯了：{str(e)}"
 
-    # === 最終回覆 ===
+    # 最終回覆
     if not isinstance(reply_text, str):
         reply_text = str(reply_text)
 
-    logger.debug(f"準備回覆訊息：{reply_text[:100]}...")
     try:
         line_bot_api.reply_message(reply_token, TextSendMessage(text=reply_text))
-        logger.debug("成功回覆訊息")
     except LineBotApiError as e:
         logger.error(f"回覆訊息失敗：{e}", exc_info=True)
 
@@ -289,25 +243,68 @@ def handle_message(event):
 
 def get_cute_reply(category):
     """
-    根據類別返回客製化的可愛回應
+    根據類別返回客製化的可愛回應 (隨機)
     """
     replies = {
-        "餐飲": "好好吃飯，才有力氣！ 🍜 (⁎⁍̴̛ᴗ⁍̴̛⁎)",
-        "飲料": "是全糖嗎？ 🧋 快樂水 get daze！",
-        "交通": "嗶嗶！出門平安 🚗 目的地就在前方！",
-        "娛樂": "哇！聽起來好好玩！ 🎮 (≧▽≦)",
-        "購物": "又要拆包裹啦！📦 快樂就是這麼樸實無華！",
-        "雜項": "嗯... 這筆花費有點神秘喔 🧐",
-        "收入": "太棒了！💰 距離財富自由又近了一步！"
+        "餐飲": [
+            "好好吃飯，才有力氣！ 🍜 (⁎⁍̴̛ᴗ⁍̴̛⁎)",
+            "吃飽飽，心情好！ 😋",
+            "這餐看起來真不錯！ 🍔",
+            "美味 +1！ 🍕",
+            "享受美食的時光～ 🍰"
+        ],
+        "飲料": [
+            "是全糖嗎？ 🧋 快樂水 get daze！",
+            "乾杯！ 🥂",
+            "喝點飲料，放鬆一下～ 🥤",
+            "是咖啡還是茶？ ☕",
+            "續命水來啦！ 💧"
+        ],
+        "交通": [
+            "嗶嗶！出門平安 🚗 目的地就在前方！",
+            "出發！ 🚀",
+            "路上小心喔！ 🚌",
+            "通勤辛苦了！ 🚲",
+            "讀萬卷書，行萬里路！ 🌍"
+        ],
+        "娛樂": [
+            "哇！聽起來好好玩！ 🎮 (≧▽≦)",
+            "Happy time! 🥳",
+            "這錢花得值得！ 🎬",
+            "充實生活，讚！ 🎭",
+            "放鬆是為了走更長遠的路！ 💖"
+        ],
+        "購物": [
+            "又要拆包裹啦！📦 快樂就是這麼樸實無華！",
+            "買！都買！ 🛍️",
+            "錢沒有不見，只是變成你喜歡的樣子！ 💸",
+            "犒賞一下自己是應該的！ 🎁",
+            "新夥伴 get！ 🤖"
+        ],
+        "雜項": [
+            "嗯... 這筆花費有點神秘喔 🧐",
+            "生活總有些意想不到的開銷～ 🤷",
+            "筆記筆記... 📝",
+            "OK，記下了！ ✍️",
+            "這又是啥？ 😅"
+        ],
+        "收入": [
+            "太棒了！💰 距離財富自由又近了一步！",
+            "發財啦！ 🤑",
+            "努力有回報！ 💪",
+            "錢錢進來！ 🧧",
+            "被動收入嗎？真好！ 📈"
+        ]
     }
-    # 如果找不到類別，就回傳一個通用的
-    return replies.get(category, "✅ 記錄完成！")
+    default_replies = ["✅ 記錄完成！", "OK！記好囉！ ✍️", "小浣熊收到！ 🦝"]
+    
+    category_replies = replies.get(category, default_replies)
+    return random.choice(category_replies)
 
 def check_budget_warning(trx_sheet, budget_sheet, user_id, category, event_time):
     """
     檢查特定類別的預算，如果接近或超過則回傳警告訊息
     """
-    # 收入不需要檢查預算
     if category == "收入":
         return ""
 
@@ -321,10 +318,8 @@ def check_budget_warning(trx_sheet, budget_sheet, user_id, category, event_time)
                 user_budget_limit = float(b.get('限額', 0))
                 break
         
-        # 如果沒有設定這個類別的預算，或預算為 0，就不用警告
         if user_budget_limit <= 0:
-            logger.debug(f"使用者 {user_id} 未設定 {category} 預算，跳過警告。")
-            return ""
+            return "" # 未設定預算
 
         # 2. 計算這個類別的本月總花費
         transactions_records = trx_sheet.get_all_records()
@@ -333,15 +328,14 @@ def check_budget_warning(trx_sheet, budget_sheet, user_id, category, event_time)
         for r in transactions_records:
             try:
                 amount = float(r.get('金額', 0))
+                # 使用 '時間' 欄位
                 if (r.get('使用者ID') == user_id and
-                    r.get('日期', '').startswith(current_month_str) and
+                    r.get('時間', '').startswith(current_month_str) and
                     r.get('類別') == category and
-                    amount < 0): # 確保是支出
+                    amount < 0):
                     spent += abs(amount)
             except (ValueError, TypeError):
                 continue
-        
-        logger.debug(f"{category} 預算 {user_budget_limit}, 本月已花 {spent}")
         
         # 3. 判斷是否警告
         percentage = (spent / user_budget_limit) * 100
@@ -352,79 +346,83 @@ def check_budget_warning(trx_sheet, budget_sheet, user_id, category, event_time)
             remaining = user_budget_limit - spent
             return f"\n\n🔔 注意！ {category} 預算只剩下 {remaining:.0f} 元囉！ (已用 {percentage:.0f}%)"
         
-        return "" # 還在安全範圍
+        return ""
     
     except Exception as e:
         logger.error(f"檢查預算警告失敗：{e}", exc_info=True)
-        # 即使檢查失敗，也不該讓主程式崩潰
         return "\n(檢查預算時發生錯誤)"
 
 def handle_nlp_record(sheet, budget_sheet, text, user_id, user_name, event_time):
+    """
+    使用 Gemini NLP 處理自然語言記帳
+    """
     logger.debug(f"處理自然語言記帳指令：{text}")
-    today = event_time.date()
-    today_str = today.strftime('%Y-%m-%d')
+    
+    # 提供包含時間的上下文
+    current_time_str = event_time.strftime('%Y-%m-%d %H:%M:%S')
+    today_str = event_time.strftime('%Y-%m-%d')
     
     date_context_lines = [
-        f"今天是 {today_str} (星期{today.weekday()})。",
+        f"今天是 {today_str} (星期{event_time.weekday()})。",
+        f"目前時間是: {event_time.strftime('%H:%M:%S')}",
         "日期參考：",
-        f"- 昨天: {(today - timedelta(days=1)).strftime('%Y-%m-%d')}"
+        f"- 昨天: {(event_time.date() - timedelta(days=1)).strftime('%Y-%m-%d')}"
     ]
-    for i in range(1, 8):
-        day = today - timedelta(days=i)
-        if day.weekday() == 0: date_context_lines.append(f"- 上週一: {day.strftime('%Y-%m-%d')}")
-        if day.weekday() == 2: date_context_lines.append(f"- 上週三: {day.strftime('%Y-%m-%d')}")
-        if day.weekday() == 4: date_context_lines.append(f"- 上週五: {day.strftime('%Y-%m-%d')}")
-
     date_context = "\n".join(date_context_lines)
     
     prompt = f"""
-    你是一個記帳機器人的 AI 助手。
+    你是一個記帳機器人的 AI 助手，你的名字是「記帳小浣熊🦝」。
     使用者的輸入是：「{text}」
     
-    目前的日期上下文如下：
+    目前的日期時間上下文如下：
     {date_context}
 
     請嚴格按照以下 JSON 格式回傳，不要有任何其他文字或 "```json" 標記：
     {{
       "status": "success" | "failure" | "chat",
-      "data": {{
-        "date": "YYYY-MM-DD",
-        "category": "餐飲" | "飲料" | "交通" | "娛樂" | "購物" | "雜項" | "收入",
-        "amount": <number>,
-        "notes": "<string>"
-      }} | null,
+      "data": [
+        {{
+          "datetime": "YYYY-MM-DD HH:MM:SS",
+          "category": "餐飲" | "飲料" | "交通" | "娛樂" | "購物" | "雜項" | "收入",
+          "amount": <number>,
+          "notes": "<string>"
+        }}
+      ] | null,
       "message": "<string>"
     }}
 
     解析規則：
-    1. 如果成功解析為記帳：
+    1. 如果成功解析為記帳 (包含一筆或多筆)：
         - status: "success"
-        - date: 必須是 YYYY-MM-DD 格式。如果沒提日期，預設為今天 ({today_str})。
+        - data: 必須是一個 "列表" (List)，包含一或多個記帳物件。
+        - datetime: 必須是 "YYYY-MM-DD HH:MM:SS" 格式。
+        - **時間規則**:
+            - 如果沒提日期或時間 (例如 "雞排 80")，預設為當下時間 ({current_time_str})。
+            - 如果只提日期 (例如 "昨天 50")，預設時間為 "12:00:00" (中午)。
+            - 如果提到 "中午"、"晚餐" 等，請盡量推斷時間 (例如 12:00:00, 18:00:00)。
         - category: 必須是 [餐飲, 飲料, 交通, 娛樂, 購物, 雜項, 收入] 之一。
-        - amount: 必須是數字。如果是「收入」，必須為正數 (+)。如果是「支出」(吃、喝、買等)，必須為負數 (-)。
+        - amount: 必須是數字。如果是「收入」，必須為正數 (+)。如果是「支出」，必須為負數 (-)。
         - notes: 盡可能擷取出花費的項目，例如「雞排」。
     2. 如果使用者只是在閒聊 (例如 "你好", "你是誰", "謝謝")：
         - status: "chat"
         - data: null
-        - message: (請用「記帳小浣熊🦝」的語氣友善回覆 )
-    3. 如果看起來像記帳，但缺少關鍵資訊 (例如 "我吃了東西" 或 "雞排" (沒說金額))：
+        - message: (請用「記帳小浣熊🦝」的語氣，"活潑"、"口語化"地友善回覆)
+    3. 如果看起來像記帳，但缺少關鍵資訊 (例如 "雞排" (沒說金額))：
         - status: "failure"
         - data: null
         - message: "🦝？我不太確定... 麻煩請提供日期和金額喔！"
     
     範例：
-    輸入: "今天中午吃了雞排80" -> {{"status": "success", "data": {{"date": "{today_str}", "category": "餐飲", "amount": -80, "notes": "雞排"}}, "message": "記錄成功"}}
-    輸入: "昨天 收入 1000" -> {{"status": "success", "data": {{"date": "{(today - timedelta(days=1)).strftime('%Y-%m-%d')}", "category": "收入", "amount": 1000, "notes": "收入"}}, "message": "記錄成功"}}
-    輸入: "你好" -> {{"status": "chat", "data": null, "message": "你好！我是記帳小浣熊🦝 需要幫忙記帳嗎？"}}
+    輸入: "今天中午吃了雞排80" -> {{"status": "success", "data": [{{"datetime": "{today_str} 12:00:00", "category": "餐飲", "amount": -80, "notes": "雞排"}}], "message": "記錄成功"}}
+    輸入: "昨天 收入 1000" -> {{"status": "success", "data": [{{"datetime": "{(event_time.date() - timedelta(days=1)).strftime('%Y-%m-%d')} 12:00:00", "category": "收入", "amount": 1000, "notes": "收入"}}], "message": "記錄成功"}}
+    輸入: "午餐1144、晚餐341" -> {{"status": "success", "data": [{{"datetime": "{today_str} 12:00:00", "category": "餐飲", "amount": -1144, "notes": "午餐"}}, {{"datetime": "{today_str} 18:00:00", "category": "餐飲", "amount": -341, "notes": "晚餐"}}], "message": "記錄 2 筆成功"}}
+    輸入: "你好" -> {{"status": "chat", "data": null, "message": "哈囉！我是記帳小浣熊🦝 需要幫忙記帳嗎？還是想聊聊天呀？"}}
     """
     
     try:
         logger.debug("發送 prompt 至 Gemini API")
-        
         response = gemini_model.generate_content(prompt)
-        
         clean_response = response.text.strip().replace("```json", "").replace("```", "")
-        
         logger.debug(f"Gemini NLP response: {clean_response}")
         
         data = json.loads(clean_response)
@@ -432,24 +430,50 @@ def handle_nlp_record(sheet, budget_sheet, text, user_id, user_name, event_time)
         message = data.get('message')
 
         if status == 'success':
-            record = data.get('data', {})
-            date = record.get('date', today_str)
-            category = record.get('category', '雜項')
-            amount = record.get('amount', 0)
-            notes = record.get('notes', text)
+            records = data.get('data', [])
+            if not records:
+                return "🦝？ AI 分析成功，但沒有返回任何記錄。"
             
-            if amount == 0:
-                return "🦝？ 金額不能是 0 喔！"
+            reply_summary_lines = []
+            last_category = "雜項" 
+            
+            # 迭代處理每一筆記錄
+            for record in records:
+                # 使用 'datetime' 欄位
+                datetime_str = record.get('datetime', current_time_str)
+                category = record.get('category', '雜項')
+                amount_str = record.get('amount', 0)
+                notes = record.get('notes', text)
+                
+                try:
+                    amount = float(amount_str)
+                    if amount == 0:
+                        reply_summary_lines.append(f"• {notes} ({category}) 金額為 0，已跳過。")
+                        continue
+                except (ValueError, TypeError):
+                    reply_summary_lines.append(f"• {notes} ({category}) 金額 '{amount_str}' 格式錯誤，已跳過。")
+                    continue
 
-            # 寫入 GSheet
-            sheet.append_row([date, category, amount, user_id, user_name, notes])
-            logger.debug("成功寫入 Google Sheet 記錄")
-                        
-            # 1. 獲取可愛回應
-            cute_reply = get_cute_reply(category)
+                # 寫入 GSheet
+                sheet.append_row([datetime_str, category, amount, user_id, user_name, notes])
+                logger.debug(f"成功寫入 Google Sheet 記錄: {datetime_str}, {category}, {amount}, {notes}")
+                
+                # 格式化摘要中的時間 (YYYY-MM-DD HH:MM)
+                try:
+                    display_time = datetime.strptime(datetime_str, '%Y-%m-%d %H:%M:%S').strftime('%Y-%m-%d %H:%M')
+                except ValueError:
+                    display_time = datetime_str # 備案
+                
+                reply_summary_lines.append(f"• {display_time} {notes} ({category}) {abs(amount):.0f} 元")
+                last_category = category
             
-            # 2. 檢查預算警告
-            warning_message = check_budget_warning(sheet, budget_sheet, user_id, category, event_time)
+            logger.debug("所有記錄寫入完畢")
+
+            # 1. 獲取可愛回應 (以最後一筆為準)
+            cute_reply = get_cute_reply(last_category)
+            
+            # 2. 檢查預算警告 (以最後一筆為準)
+            warning_message = check_budget_warning(sheet, budget_sheet, user_id, last_category, event_time)
             
             # 3. 計算總餘額
             all_records = sheet.get_all_records()
@@ -457,18 +481,18 @@ def handle_nlp_record(sheet, budget_sheet, text, user_id, user_name, event_time)
             for r in all_records:
                 if r.get('使用者ID') == user_id:
                     try:
-                        amount_val = float(r.get('金額', 0)) # 避免變數名稱衝突
-                        user_balance += amount_val
+                        user_balance += float(r.get('金額', 0))
                     except (ValueError, TypeError):
                         continue
             
             # 4. 組合最終回覆
-            # 修改：格式化 amount 和 user_balance 為 .0f (無小數點)
+            summary_text = "\n".join(reply_summary_lines)
             return (
                 f"{cute_reply}\n\n"
-                f"📝 摘要：{date} {notes} ({category}) {abs(amount):.0f} 元\n"
+                f"📝 **摘要 (共 {len(reply_summary_lines)} 筆)**：\n"
+                f"{summary_text}\n\n"
                 f"📈 {user_name} 目前總餘額：{user_balance:.0f} 元"
-                f"{warning_message}" # 這個字串本身就包含 \n\n (如果有的話)
+                f"{warning_message}"
             )
 
         elif status == 'chat':
@@ -477,14 +501,17 @@ def handle_nlp_record(sheet, budget_sheet, text, user_id, user_name, event_time)
         else:
             return message or "🦝？ 抱歉，我聽不懂..."
 
-    except json.JSONDecodeError:
+    except json.JSONDecodeError as e:
         logger.error(f"Gemini NLP JSON 解析失敗: {clean_response}")
-        return "糟糕！AI 分析器暫時罷工了 (JSON解析失敗)... 請稍後再試。"
+        return f"糟糕！AI 分析器暫時罷工了 (JSON解析失敗)：{clean_response}"
     except Exception as e:
         logger.error(f"Gemini API 呼叫或 GSheet 寫入失敗：{e}", exc_info=True)
         return f"目前我無法處理這個請求：{str(e)}"
 
 def handle_check_balance(sheet, user_id):
+    """
+    處理 '查帳' 指令
+    """
     logger.debug(f"處理 '查帳' 指令，user_id: {user_id}")
     try:
         records = sheet.get_all_records()
@@ -497,20 +524,17 @@ def handle_check_balance(sheet, user_id):
         total_expense = 0.0
         
         for r in user_records:
-            amount_str = r.get('金額')
             try:
-                amount = float(amount_str)
+                amount = float(r.get('金額', 0))
                 if amount > 0:
                     total_income += amount
                 else:
                     total_expense += amount
             except (ValueError, TypeError):
-                logger.warning(f"跳過無效金額 '{amount_str}' for user {user_id}")
                 continue
 
         total_balance = total_income + total_expense
         
-        # 修改：格式化所有金額為 .0f (無小數點)
         return (
             f"📊 **您的財務總覽**：\n\n"
             f"💰 總收入：{total_income:.0f} 元\n"
@@ -523,6 +547,9 @@ def handle_check_balance(sheet, user_id):
         return f"查帳失敗：無法讀取試算表：{str(e)}"
 
 def handle_monthly_report(sheet, user_id, event_time):
+    """
+    處理 '月結' 指令
+    """
     logger.debug(f"處理 '月結' 指令，user_id: {user_id}")
     try:
         records = sheet.get_all_records()
@@ -530,7 +557,7 @@ def handle_monthly_report(sheet, user_id, event_time):
         user_month_records = [
             r for r in records 
             if r.get('使用者ID') == user_id 
-            and r.get('日期', '').startswith(current_month_str)
+            and r.get('時間', '').startswith(current_month_str) # 使用 '時間' 欄位
         ]
         
         if not user_month_records:
@@ -541,9 +568,8 @@ def handle_monthly_report(sheet, user_id, event_time):
         category_spending = {}
 
         for r in user_month_records:
-            amount_str = r.get('金額')
             try:
-                amount = float(amount_str)
+                amount = float(r.get('金額', 0))
                 if amount > 0:
                     total_income += amount
                 else:
@@ -553,7 +579,6 @@ def handle_monthly_report(sheet, user_id, event_time):
             except (ValueError, TypeError):
                 continue
         
-        # 修改：格式化總結金額為 .0f (無小數點)
         reply = f"📅 **{current_month_str} 月結報表**：\n\n"
         reply += f"💰 本月收入：{total_income:.0f} 元\n"
         reply += f"💸 本月支出：{abs(total_expense):.0f} 元\n"
@@ -566,7 +591,6 @@ def handle_monthly_report(sheet, user_id, event_time):
             for i, (category, amount) in enumerate(sorted_spending):
                 icon = ["🥇", "🥈", "🥉"]
                 prefix = icon[i] if i < 3 else "🔹"
-                # 修改：格式化分類金額為 .0f (無小數點)
                 reply += f"{prefix} {category}: {amount:.0f} 元\n"
         
         return reply
@@ -575,22 +599,26 @@ def handle_monthly_report(sheet, user_id, event_time):
         return f"月結報表產生失敗：{str(e)}"
 
 def handle_delete_record(sheet, user_id):
+    """
+    處理 '刪除' 指令，刪除使用者的最後一筆記錄
+    """
     logger.debug(f"處理 '刪除' 指令，user_id: {user_id}")
     try:
         all_values = sheet.get_all_values()
-        user_id_col_index = 3 
+        user_id_col_index = 3 # A=0, B=1, C=2, D=3
         
+        # 從後往前找
         for row_index in range(len(all_values) - 1, 0, -1):
             row = all_values[row_index]
             if len(row) > user_id_col_index and row[user_id_col_index] == user_id:
                 row_to_delete = row_index + 1
                 
-                # 修改：格式化刪除訊息中的金額為 .0f (無小數點)
                 try:
-                    amount_val = float(row[2]) # row[2] 是金額欄位
+                    # row[0] 是 '時間', row[1] 是 '類別', row[2] 是 '金額'
+                    amount_val = float(row[2])
                     deleted_desc = f"{row[0]} {row[1]} {amount_val:.0f} 元"
-                except (ValueError, TypeError):
-                    deleted_desc = f"{row[0]} {row[1]} {row[2]} 元" # 轉換失敗時的備案
+                except (ValueError, TypeError, IndexError):
+                    deleted_desc = f"第 {row_to_delete} 行的記錄"
                 
                 sheet.delete_rows(row_to_delete)
                 return f"🗑️ 已刪除：{deleted_desc}"
@@ -601,6 +629,9 @@ def handle_delete_record(sheet, user_id):
         return f"刪除記錄失敗：{str(e)}"
 
 def handle_set_budget(sheet, text, user_id):
+    """
+    處理 '設置預算' 指令
+    """
     logger.debug(f"處理 '設置預算' 指令，user_id: {user_id}, text: {text}")
     match = re.match(r'設置預算\s+([\u4e00-\u9fa5]+)\s+(\d+)', text)
     if not match:
@@ -617,6 +648,7 @@ def handle_set_budget(sheet, text, user_id):
         cell_list = sheet.findall(user_id)
         found_row = -1
         
+        # 檢查是否已存在該類別預算
         for cell in cell_list:
             row_values = sheet.row_values(cell.row)
             if len(row_values) > 1 and row_values[1] == category:
@@ -624,16 +656,19 @@ def handle_set_budget(sheet, text, user_id):
                 break
         
         if found_row != -1:
-            sheet.update_cell(found_row, 3, limit)
+            sheet.update_cell(found_row, 3, limit) # 更新限額
             return f"✅ 已更新預算：{category} {limit} 元" 
         else:
-            sheet.append_row([user_id, category, limit])
+            sheet.append_row([user_id, category, limit]) # 新增預算
             return f"✅ 已設置預算：{category} {limit} 元" 
     except Exception as e:
         logger.error(f"設置預算失敗：{e}", exc_info=True)
         return f"設置預算失敗：{str(e)}"
 
 def handle_view_budget(trx_sheet, budget_sheet, user_id, event_time):
+    """
+    處理 '查看預算' 指令
+    """
     logger.debug(f"處理 '查看預算' 指令，user_id: {user_id}")
     try:
         budgets_records = budget_sheet.get_all_records()
@@ -649,8 +684,9 @@ def handle_view_budget(trx_sheet, budget_sheet, user_id, event_time):
         for r in transactions_records:
             try:
                 amount = float(r.get('金額', 0))
+                # 使用 '時間' 欄位
                 if (r.get('使用者ID') == user_id and
-                    r.get('日期', '').startswith(current_month_str) and
+                    r.get('時間', '').startswith(current_month_str) and
                     amount < 0):
                     user_month_expenses.append(r)
             except (ValueError, TypeError):
@@ -671,6 +707,8 @@ def handle_view_budget(trx_sheet, budget_sheet, user_id, event_time):
             total_spent += spent
             remaining = limit - spent
             percentage = (spent / limit) * 100
+            
+            # 製作進度條
             bar_fill = '■' * int(percentage / 10)
             bar_empty = '□' * (10 - int(percentage / 10))
             if percentage > 100:
@@ -700,55 +738,144 @@ def handle_view_budget(trx_sheet, budget_sheet, user_id, event_time):
         logger.error(f"查看預算失敗：{e}", exc_info=True)
         return f"查看預算失敗：{str(e)}"
 
-# === 新增：步驟三，加入「查詢」核心函式 ===
-def handle_search_records(sheet, user_id, keyword):
+def handle_search_records(sheet, user_id, query_text, event_time):
     """
-    處理關鍵字查詢
+    處理關鍵字和日期區間查詢 (使用 NLP)
     """
-    logger.debug(f"處理 '查詢' 指令，user_id: {user_id}, keyword: {keyword}")
+    logger.debug(f"處理 '查詢' 指令，user_id: {user_id}, query: {query_text}")
+
+    # 1. 建立日期上下文
+    today = event_time.date()
+    today_str = today.strftime('%Y-%m-%d')
+    
+    date_context_lines = [
+        f"今天是 {today_str} (星期{today.weekday()})。",
+        f"本週一: {(today - timedelta(days=today.weekday())).strftime('%Y-%m-%d')}",
+        f"本月一日: {today.replace(day=1).strftime('%Y-%m-%d')}",
+        f"昨天: {(today - timedelta(days=1)).strftime('%Y-%m-%d')}",
+    ]
+    date_context = "\n".join(date_context_lines)
+
+    # 2. 建立查詢專用 Prompt
+    prompt = f"""
+    你是一個查詢助手。使用者的查詢是：「{query_text}」
+    
+    目前的日期上下文如下：
+    {date_context}
+
+    請嚴格按照以下 JSON 格式回傳：
+    {{
+      "status": "success" | "failure",
+      "keyword": "<string>" | null,
+      "start_date": "YYYY-MM-DD" | null,
+      "end_date": "YYYY-MM-DD" | null,
+      "message": "<string>"
+    }}
+    
+    解析規則：
+    1. status: "success"
+    2. keyword: 提取查詢的關鍵字 (例如 "雞排", "餐飲")。如果沒有關鍵字，則為 null。
+    3. start_date: 提取查詢的 "起始日期"。
+    4. end_date: 提取查詢的 "結束日期"。
+    5. 如果只提到 "今天"、"昨天" 或 "10/20"，則 start_date 和 end_date 應為同一天。
+    6. 如果提到 "這禮拜"，start_date 應為 {date_context_lines[1][-10:]}，end_date 應為 {today_str}。
+    7. 如果提到 "這個月"，start_date 應為 {date_context_lines[2][-10:]}，end_date 應為 {today_str}。
+
+    範例：
+    輸入: "雞排" -> {{"status": "success", "keyword": "雞排", "start_date": null, "end_date": null, "message": "查詢關鍵字：雞排"}}
+    輸入: "這禮拜的餐飲" -> {{"status": "success", "keyword": "餐飲", "start_date": "{(today - timedelta(days=today.weekday())).strftime('%Y-%m-%d')}", "end_date": "{today_str}", "message": "查詢本週的餐飲"}}
+    輸入: "10/1 到 10/10" -> {{"status": "success", "keyword": null, "start_date": "{today.year}-10-01", "end_date": "{today.year}-10-10", "message": "查詢 10/1 到 10/10"}}
+    輸入: "昨天" -> {{"status": "success", "keyword": null, "start_date": "{(today - timedelta(days=1)).strftime('%Y-%m-%d')}", "end_date": "{(today - timedelta(days=1)).strftime('%Y-%m-%d')}", "message": "查詢昨天的記錄"}}
+    """
+
     try:
+        # 3. 呼叫 Gemini 解析查詢
+        logger.debug("發送 search prompt 至 Gemini API")
+        response = gemini_model.generate_content(prompt)
+        clean_response = response.text.strip().replace("```json", "").replace("```", "")
+        logger.debug(f"Gemini Search response: {clean_response}")
+        
+        try:
+            parsed_query = json.loads(clean_response)
+        except json.JSONDecodeError:
+            logger.error(f"Gemini Search JSON 解析失敗: {clean_response}")
+            return f"糟糕！AI 查詢分析器暫時罷工了 (JSON解析失敗)。"
+
+        if parsed_query.get('status') == 'failure':
+            return parsed_query.get('message', "🦝 查詢失敗，我不太懂您的意思。")
+
+        keyword = parsed_query.get('keyword')
+        start_date = parsed_query.get('start_date')
+        end_date = parsed_query.get('end_date')
+        nlp_message = parsed_query.get('message', f"關鍵字「{keyword or ''}」")
+
+        # 4. 讀取並篩選 Google Sheet 資料
         records = sheet.get_all_records()
         matches = []
         
-        # 篩選符合 user_id 和 keyword 的記錄
+        try:
+            start_dt = datetime.strptime(start_date, '%Y-%m-%d').date() if start_date else None
+            end_dt = datetime.strptime(end_date, '%Y-%m-%d').date() if end_date else None
+        except ValueError as e:
+            return f"AI 回傳的日期格式錯誤 ({start_date}, {end_date})。"
+
         for r in records:
-            if r.get('使用者ID') == user_id:
-                # 檢查「類別」或「備註」欄位是否包含關鍵字
-                if keyword in r.get('類別', '') or keyword in r.get('備註', ''):
-                    matches.append(r)
-        
-        if not matches:
-            return f"🦝 找不到關於「{keyword}」的任何記錄喔！"
-        
-        # 格式化回覆訊息
-        reply = f"🔎 關鍵字「{keyword}」的搜尋結果 (共 {len(matches)} 筆)：\n\n"
-        total_amount = 0.0
-        limit = 15 # 最多顯示 15 筆，避免訊息過長
-        
-        # 為了排序，我們先處理所有匹配的記錄
-        sorted_matches = sorted(matches, key=lambda x: x.get('日期', ''), reverse=True)
-        
-        for r in sorted_matches[:limit]:
-            try:
-                date = r.get('日期', 'N/A')
-                category = r.get('類別', 'N/A')
-                notes = r.get('備註', 'N/A')
-                amount = float(r.get('金額', 0))
-                
-                total_amount += amount # 計算前 limit 筆的總和 (或所有?) 
-                                    # 這裡改為計算所有匹配的總和
-                
-                # 格式化單筆記錄
-                reply += f"• {date} {notes} ({category}) {amount:.0f} 元\n"
-                
-            except (ValueError, TypeError):
+            if r.get('使用者ID') != user_id:
                 continue
+            
+            keyword_match = True
+            date_match = True
+            
+            # 檢查關鍵字
+            if keyword:
+                keyword_match = (keyword in r.get('類別', '')) or (keyword in r.get('備註', ''))
+            
+            # 檢查日期 (使用 '時間' 欄位)
+            record_datetime_str = r.get('時間', '')
+            if (start_dt or end_dt) and record_datetime_str:
+                try:
+                    # 轉換為 YYYY-MM-DD HH:MM:SS 格式的 datetime 物件，再取 .date()
+                    record_dt = datetime.strptime(record_datetime_str, '%Y-%m-%d %H:%M:%S').date()
+                    if start_dt and record_dt < start_dt:
+                        date_match = False
+                    if end_dt and record_dt > end_dt:
+                        date_match = False
+                except ValueError:
+                    date_match = False # 日期格式錯誤，當作不匹配
+            
+            if keyword_match and date_match:
+                matches.append(r)
         
-        # 計算所有匹配項的總和 (而不是只有前15筆)
+        # 5. 格式化回覆
+        if not matches:
+            return f"🦝 找不到關於「{nlp_message}」的任何記錄喔！"
+        
+        reply = f"🔎 {nlp_message} (共 {len(matches)} 筆)：\n\n"
+        limit = 20 # 最多顯示 20 筆
+        
+        sorted_matches = sorted(matches, key=lambda x: x.get('時間', ''), reverse=True)
+        
         total_amount_all_matches = 0.0
-        for r in matches:
+        
+        for r in sorted_matches:
              try:
-                total_amount_all_matches += float(r.get('金額', 0))
+                amount = float(r.get('金額', 0))
+                total_amount_all_matches += amount
+                
+                # 只顯示前 limit 筆的詳細資訊
+                if len(reply.split('\n')) <= limit + 5: # 估算行數
+                    category = r.get('類別', 'N/A')
+                    notes = r.get('備註', 'N/A')
+                    date_str = r.get('時間', 'N/A')
+                    
+                    # 格式化時間為 YYYY-MM-DD HH:MM
+                    try:
+                        display_date = datetime.strptime(date_str, '%Y-%m-%d %H:%M:%S').strftime('%Y-%m-%d %H:%M')
+                    except ValueError:
+                        display_date = date_str
+                    
+                    reply += f"• {display_date} {notes} ({category}) {amount:.0f} 元\n"
+                    
              except (ValueError, TypeError):
                 continue
         
@@ -756,15 +883,13 @@ def handle_search_records(sheet, user_id, keyword):
         reply += f"📈 查詢總計：{total_amount_all_matches:.0f} 元\n"
         
         if len(matches) > limit:
-            reply += f"(只顯示最近 {limit} 筆記錄)"
+            reply += f"(僅顯示最近 {limit} 筆記錄)"
             
         return reply
         
     except Exception as e:
         logger.error(f"查詢記錄失敗：{e}", exc_info=True)
         return f"查詢失敗：{str(e)}"
-# === 新增結束 ===
-
 
 # === 主程式入口 ===
 if __name__ == "__main__":
