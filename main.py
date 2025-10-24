@@ -891,7 +891,7 @@ def handle_search_records(sheet, user_id, query_text, event_time):
                     category = r.get('類別', 'N/A')
                     notes = r.get('備註', 'N/A')
                     
-                    # === 關鍵修正：使用輔助函式並處理兩種日期格式 (顯示用) ===
+                    # ===  使用輔助函式並處理兩種日期格式  ===
                     date_str = get_datetime_from_record(r)
                     
                     if not date_str:
