@@ -17,17 +17,17 @@ from dotenv import load_dotenv
 logging.basicConfig(level=logging.DEBUG, format='%(asctime)s - %(name)s - %(levelname)s - %(message)s')
 logger = logging.getLogger(__name__)
 
-# === 步驟 1：載入環境變數 ===
+# === 載入環境變數 ===
 load_dotenv()
 
-# === 步驟 2：從環境變數讀取金鑰 ===
+# === 從環境變數讀取金鑰 ===
 LINE_CHANNEL_ACCESS_TOKEN = os.getenv("LINE_CHANNEL_ACCESS_TOKEN")
 LINE_CHANNEL_SECRET = os.getenv("LINE_CHANNEL_SECRET")
 GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
 GOOGLE_SHEET_NAME = os.getenv("GOOGLE_SHEET_NAME", '記帳小浣熊資料庫')
 GOOGLE_SHEET_ID = os.getenv("GOOGLE_SHEET_ID")
 
-# === 步驟 3：驗證金鑰是否已載入 ===
+# === 驗證金鑰是否已載入 ===
 if not all([LINE_CHANNEL_ACCESS_TOKEN, LINE_CHANNEL_SECRET, GEMINI_API_KEY, GOOGLE_SHEET_ID]):
     logger.error("!!! 關鍵金鑰載入失敗 !!!")
     raise ValueError("金鑰未配置，請檢查 .env 檔案")
@@ -87,14 +87,27 @@ def ensure_worksheets(workbook):
     try:
         try:
             trx_sheet = workbook.worksheet('Transactions')
+            logger.debug("找到 Transactions 工作表")
+            # 檢查標頭，如果為空(例如全新的sheet)，則寫入
+            header = trx_sheet.row_values(1)
+            if not header:
+                 logger.debug("Transactions 工作表為空，正在寫入標頭...")
+                 trx_sheet.append_row(['時間', '類別', '金額', '使用者ID', '使用者名稱', '備註'])
+                 
         except gspread.exceptions.WorksheetNotFound:
             logger.debug("未找到 Transactions 工作表，正在創建...")
             trx_sheet = workbook.add_worksheet(title='Transactions', rows=1000, cols=10)
-            # 修改欄位名稱：日期 -> 時間
+            # 統一使用 '時間' 作為標頭
             trx_sheet.append_row(['時間', '類別', '金額', '使用者ID', '使用者名稱', '備註'])
 
         try:
             budget_sheet = workbook.worksheet('Budgets')
+            logger.debug("找到 Budgets 工作表")
+            header_budget = budget_sheet.row_values(1)
+            if not header_budget:
+                logger.debug("Budgets 工作表為空，正在寫入標頭...")
+                budget_sheet.append_row(['使用者ID', '類別', '限額'])
+                
         except gspread.exceptions.WorksheetNotFound:
             logger.debug("未找到 Budgets 工作表，正在創建...")
             budget_sheet = workbook.add_worksheet(title='Budgets', rows=100, cols=5)
@@ -241,6 +254,16 @@ def handle_message(event):
 
 # === 核心功能函式 (Helper Functions) ===
 
+# === 關鍵修正：新增輔助函式 ===
+def get_datetime_from_record(r):
+    """
+    相容性輔助函式：
+    優先嘗試讀取 '時間' (新)，如果沒有，再讀取 '日期' (舊)
+    """
+    return r.get('時間', r.get('日期', ''))
+# === 修正結束 ===
+
+
 def get_cute_reply(category):
     """
     根據類別返回客製化的可愛回應 (隨機)
@@ -310,7 +333,6 @@ def check_budget_warning(trx_sheet, budget_sheet, user_id, category, event_time)
 
     logger.debug(f"正在為 {user_id} 檢查 {category} 的預算...")
     try:
-        # 1. 找到這個類別的預算
         budgets_records = budget_sheet.get_all_records()
         user_budget_limit = 0.0
         for b in budgets_records:
@@ -321,23 +343,24 @@ def check_budget_warning(trx_sheet, budget_sheet, user_id, category, event_time)
         if user_budget_limit <= 0:
             return "" # 未設定預算
 
-        # 2. 計算這個類別的本月總花費
         transactions_records = trx_sheet.get_all_records()
         current_month_str = event_time.strftime('%Y-%m')
         spent = 0.0
         for r in transactions_records:
             try:
                 amount = float(r.get('金額', 0))
-                # 使用 '時間' 欄位
+                # === 關鍵修正：使用輔助函式 ===
+                record_time_str = get_datetime_from_record(r)
+                
                 if (r.get('使用者ID') == user_id and
-                    r.get('時間', '').startswith(current_month_str) and
+                    record_time_str.startswith(current_month_str) and
                     r.get('類別') == category and
                     amount < 0):
                     spent += abs(amount)
             except (ValueError, TypeError):
                 continue
         
-        # 3. 判斷是否警告
+        # 判斷是否警告
         percentage = (spent / user_budget_limit) * 100
         
         if percentage >= 100:
@@ -358,7 +381,6 @@ def handle_nlp_record(sheet, budget_sheet, text, user_id, user_name, event_time)
     """
     logger.debug(f"處理自然語言記帳指令：{text}")
     
-    # 提供包含時間的上下文
     current_time_str = event_time.strftime('%Y-%m-%d %H:%M:%S')
     today_str = event_time.strftime('%Y-%m-%d')
     
@@ -439,7 +461,6 @@ def handle_nlp_record(sheet, budget_sheet, text, user_id, user_name, event_time)
             
             # 迭代處理每一筆記錄
             for record in records:
-                # 使用 'datetime' 欄位
                 datetime_str = record.get('datetime', current_time_str)
                 category = record.get('category', '雜項')
                 amount_str = record.get('amount', 0)
@@ -454,28 +475,24 @@ def handle_nlp_record(sheet, budget_sheet, text, user_id, user_name, event_time)
                     reply_summary_lines.append(f"• {notes} ({category}) 金額 '{amount_str}' 格式錯誤，已跳過。")
                     continue
 
-                # 寫入 GSheet
+                # 寫入 GSheet (第一欄)
+                # 即使 GSheet 標頭是 '日期'，append_row 仍會寫入第一欄
                 sheet.append_row([datetime_str, category, amount, user_id, user_name, notes])
                 logger.debug(f"成功寫入 Google Sheet 記錄: {datetime_str}, {category}, {amount}, {notes}")
                 
-                # 格式化摘要中的時間 (YYYY-MM-DD HH:MM)
                 try:
                     display_time = datetime.strptime(datetime_str, '%Y-%m-%d %H:%M:%S').strftime('%Y-%m-%d %H:%M')
                 except ValueError:
-                    display_time = datetime_str # 備案
+                    display_time = datetime_str 
                 
                 reply_summary_lines.append(f"• {display_time} {notes} ({category}) {abs(amount):.0f} 元")
                 last_category = category
             
             logger.debug("所有記錄寫入完畢")
 
-            # 1. 獲取可愛回應 (以最後一筆為準)
             cute_reply = get_cute_reply(last_category)
-            
-            # 2. 檢查預算警告 (以最後一筆為準)
             warning_message = check_budget_warning(sheet, budget_sheet, user_id, last_category, event_time)
             
-            # 3. 計算總餘額
             all_records = sheet.get_all_records()
             user_balance = 0.0
             for r in all_records:
@@ -485,7 +502,6 @@ def handle_nlp_record(sheet, budget_sheet, text, user_id, user_name, event_time)
                     except (ValueError, TypeError):
                         continue
             
-            # 4. 組合最終回覆
             summary_text = "\n".join(reply_summary_lines)
             return (
                 f"{cute_reply}\n\n"
@@ -554,11 +570,14 @@ def handle_monthly_report(sheet, user_id, event_time):
     try:
         records = sheet.get_all_records()
         current_month_str = event_time.strftime('%Y-%m')
-        user_month_records = [
-            r for r in records 
-            if r.get('使用者ID') == user_id 
-            and r.get('時間', '').startswith(current_month_str) # 使用 '時間' 欄位
-        ]
+        
+        user_month_records = []
+        for r in records:
+            # === 關鍵修正：使用輔助函式 ===
+            record_time_str = get_datetime_from_record(r)
+            if (r.get('使用者ID') == user_id and 
+                record_time_str.startswith(current_month_str)):
+                user_month_records.append(r)
         
         if not user_month_records:
             return f"📅 {current_month_str} 月報表：\n您這個月還沒有任何記錄喔！"
@@ -601,20 +620,20 @@ def handle_monthly_report(sheet, user_id, event_time):
 def handle_delete_record(sheet, user_id):
     """
     處理 '刪除' 指令，刪除使用者的最後一筆記錄
+    (此函式使用 index-based 的 get_all_values, 不受標頭名稱影響)
     """
     logger.debug(f"處理 '刪除' 指令，user_id: {user_id}")
     try:
         all_values = sheet.get_all_values()
         user_id_col_index = 3 # A=0, B=1, C=2, D=3
         
-        # 從後往前找
         for row_index in range(len(all_values) - 1, 0, -1):
             row = all_values[row_index]
             if len(row) > user_id_col_index and row[user_id_col_index] == user_id:
                 row_to_delete = row_index + 1
                 
                 try:
-                    # row[0] 是 '時間', row[1] 是 '類別', row[2] 是 '金額'
+                    # row[0] 是 '時間'/'日期', row[1] 是 '類別', row[2] 是 '金額'
                     amount_val = float(row[2])
                     deleted_desc = f"{row[0]} {row[1]} {amount_val:.0f} 元"
                 except (ValueError, TypeError, IndexError):
@@ -648,7 +667,6 @@ def handle_set_budget(sheet, text, user_id):
         cell_list = sheet.findall(user_id)
         found_row = -1
         
-        # 檢查是否已存在該類別預算
         for cell in cell_list:
             row_values = sheet.row_values(cell.row)
             if len(row_values) > 1 and row_values[1] == category:
@@ -656,10 +674,10 @@ def handle_set_budget(sheet, text, user_id):
                 break
         
         if found_row != -1:
-            sheet.update_cell(found_row, 3, limit) # 更新限額
+            sheet.update_cell(found_row, 3, limit) 
             return f"✅ 已更新預算：{category} {limit} 元" 
         else:
-            sheet.append_row([user_id, category, limit]) # 新增預算
+            sheet.append_row([user_id, category, limit]) 
             return f"✅ 已設置預算：{category} {limit} 元" 
     except Exception as e:
         logger.error(f"設置預算失敗：{e}", exc_info=True)
@@ -684,9 +702,11 @@ def handle_view_budget(trx_sheet, budget_sheet, user_id, event_time):
         for r in transactions_records:
             try:
                 amount = float(r.get('金額', 0))
-                # 使用 '時間' 欄位
+                # === 關鍵修正：使用輔助函式 ===
+                record_time_str = get_datetime_from_record(r)
+                
                 if (r.get('使用者ID') == user_id and
-                    r.get('時間', '').startswith(current_month_str) and
+                    record_time_str.startswith(current_month_str) and
                     amount < 0):
                     user_month_expenses.append(r)
             except (ValueError, TypeError):
@@ -708,7 +728,6 @@ def handle_view_budget(trx_sheet, budget_sheet, user_id, event_time):
             remaining = limit - spent
             percentage = (spent / limit) * 100
             
-            # 製作進度條
             bar_fill = '■' * int(percentage / 10)
             bar_empty = '□' * (10 - int(percentage / 10))
             if percentage > 100:
@@ -826,22 +845,27 @@ def handle_search_records(sheet, user_id, query_text, event_time):
             keyword_match = True
             date_match = True
             
-            # 檢查關鍵字
             if keyword:
                 keyword_match = (keyword in r.get('類別', '')) or (keyword in r.get('備註', ''))
             
-            # 檢查日期 (使用 '時間' 欄位)
-            record_datetime_str = r.get('時間', '')
+            # === 關鍵修正：使用輔助函式並處理兩種日期格式 ===
+            record_datetime_str = get_datetime_from_record(r)
+            
             if (start_dt or end_dt) and record_datetime_str:
                 try:
-                    # 轉換為 YYYY-MM-DD HH:MM:SS 格式的 datetime 物件，再取 .date()
-                    record_dt = datetime.strptime(record_datetime_str, '%Y-%m-%d %H:%M:%S').date()
+                    # 嘗試解析 YYYY-MM-DD HH:MM:SS (新)
+                    if len(record_datetime_str) > 10:
+                        record_dt = datetime.strptime(record_datetime_str, '%Y-%m-%d %H:%M:%S').date()
+                    # 嘗試解析 YYYY-MM-DD (舊)
+                    else:
+                        record_dt = datetime.strptime(record_datetime_str, '%Y-%m-%d').date()
+                        
                     if start_dt and record_dt < start_dt:
                         date_match = False
                     if end_dt and record_dt > end_dt:
                         date_match = False
                 except ValueError:
-                    date_match = False # 日期格式錯誤，當作不匹配
+                    date_match = False 
             
             if keyword_match and date_match:
                 matches.append(r)
@@ -851,9 +875,10 @@ def handle_search_records(sheet, user_id, query_text, event_time):
             return f"🦝 找不到關於「{nlp_message}」的任何記錄喔！"
         
         reply = f"🔎 {nlp_message} (共 {len(matches)} 筆)：\n\n"
-        limit = 20 # 最多顯示 20 筆
+        limit = 20 
         
-        sorted_matches = sorted(matches, key=lambda x: x.get('時間', ''), reverse=True)
+        # === 關鍵修正：使用輔助函式排序 ===
+        sorted_matches = sorted(matches, key=lambda x: get_datetime_from_record(x), reverse=True)
         
         total_amount_all_matches = 0.0
         
@@ -862,17 +887,25 @@ def handle_search_records(sheet, user_id, query_text, event_time):
                 amount = float(r.get('金額', 0))
                 total_amount_all_matches += amount
                 
-                # 只顯示前 limit 筆的詳細資訊
-                if len(reply.split('\n')) <= limit + 5: # 估算行數
+                if len(reply.split('\n')) <= limit + 5: 
                     category = r.get('類別', 'N/A')
                     notes = r.get('備註', 'N/A')
-                    date_str = r.get('時間', 'N/A')
                     
-                    # 格式化時間為 YYYY-MM-DD HH:MM
-                    try:
-                        display_date = datetime.strptime(date_str, '%Y-%m-%d %H:%M:%S').strftime('%Y-%m-%d %H:%M')
-                    except ValueError:
-                        display_date = date_str
+                    # === 關鍵修正：使用輔助函式並處理兩種日期格式 (顯示用) ===
+                    date_str = get_datetime_from_record(r)
+                    
+                    if not date_str:
+                         display_date = "N/A"
+                    else:
+                        try:
+                            # 嘗試格式化 YYYY-MM-DD HH:MM:SS (新)
+                            if len(date_str) > 10:
+                                display_date = datetime.strptime(date_str, '%Y-%m-%d %H:%M:%S').strftime('%Y-%m-%d %H:%M')
+                            # 嘗試格式化 YYYY-MM-DD (舊)
+                            else:
+                                display_date = datetime.strptime(date_str, '%Y-%m-%d').strftime('%Y-%m-%d')
+                        except ValueError:
+                            display_date = date_str # 備案：直接顯示原始字串
                     
                     reply += f"• {display_date} {notes} ({category}) {amount:.0f} 元\n"
                     
