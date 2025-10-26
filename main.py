@@ -12,6 +12,12 @@ from linebot.models import MessageEvent, TextMessage, TextSendMessage
 from google.oauth2.service_account import Credentials
 from datetime import datetime, timedelta, date
 from dotenv import load_dotenv
+from zoneinfo import ZoneInfo
+
+# === 時區設定（可用環境變數 APP_TZ 覆蓋，預設 Asia/Taipei） ===
+APP_TZ = os.getenv('APP_TZ', 'Asia/Taipei')
+TIMEZONE = ZoneInfo(APP_TZ)
+
 
 # === 配置日誌 ===
 logging.basicConfig(level=logging.DEBUG, format='%(asctime)s - %(name)s - %(levelname)s - %(message)s')
@@ -154,9 +160,10 @@ def handle_message(event):
     user_id = event.source.user_id
     line_timestamp_ms = event.timestamp
     # event_time 就是「傳送時間」
-    event_time = datetime.fromtimestamp(line_timestamp_ms / 1000.0)
+    event_time = datetime.fromtimestamp(line_timestamp_ms / 1000.0, tz=TIMEZONE)
     
     logger.debug(f"Received message: '{text}' from user '{user_id}' at {event_time}")
+    logger.debug(f"事件時間 (tz={APP_TZ})：{event_time.isoformat()}")
     
     # 1. 幫助指令 (優先)
     if text == "幫助":
