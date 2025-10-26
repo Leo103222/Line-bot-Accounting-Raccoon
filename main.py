@@ -428,7 +428,7 @@ def handle_nlp_record(sheet, budget_sheet, text, user_id, user_name, event_time)
     2. 如果使用者只是在閒聊 (例如 "你好", "你是誰", "謝謝")：
         - status: "chat"
         - data: null
-        - message: (請用「記帳小浣熊🦝」的語氣，"活潑"、"口語化"地友善回覆)
+        - message: (請用「記帳小浣熊🦝」的語氣，"活潑"、"口語化"地友善回覆，可以適當聊天，但還是得拉回記帳，如果問你為甚麼叫小浣熊，回答因為開發我的人大家都叫他浣熊，回復可以適當加一些表情符號)
     3. 如果看起來像記帳，但缺少關鍵資訊 (例如 "雞排" (沒說金額))：
         - status: "failure"
         - data: null
