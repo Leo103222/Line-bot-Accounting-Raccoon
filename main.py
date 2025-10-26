@@ -24,6 +24,10 @@ TIMEZONE = ZoneInfo(APP_TZ)
 logging.basicConfig(level=logging.DEBUG, format='%(asctime)s - %(name)s - %(levelname)s - %(message)s')
 logger = logging.getLogger(__name__)
 
+# === 刪除預覽狀態暫存 (用於「確認刪除」功能) ===
+# 格式: {user_id: {'rows': [row_numbers], 'timestamp': datetime, 'message': '預覽訊息'}}
+delete_preview_cache = {}
+
 # === 載入環境變數 ===
 load_dotenv()
 
@@ -98,12 +102,12 @@ def ensure_worksheets(workbook):
             header = trx_sheet.row_values(1)
             if not header:
                  logger.debug("Transactions 工作表為空，正在寫入標頭...")
-                 trx_sheet.append_row(['時間', '類別', '金額', '使用者ID', '使用者名稱', '備註'])
+                 trx_sheet.append_row(['日期', '類別', '金額', '使用者ID', '使用者名稱', '備註'])
                  
         except gspread.exceptions.WorksheetNotFound:
             logger.debug("未找到 Transactions 工作表，正在創建...")
             trx_sheet = workbook.add_worksheet(title='Transactions', rows=1000, cols=10)
-            trx_sheet.append_row(['時間', '類別', '金額', '使用者ID', '使用者名稱', '備註'])
+            trx_sheet.append_row(['日期', '類別', '金額', '使用者ID', '使用者名稱', '備註'])
 
         try:
             budget_sheet = workbook.worksheet('Budgets')
@@ -189,8 +193,10 @@ def handle_message(event):
             "   - 「我還剩多少預算？」\n\n"
             "🗑️ **刪除**：\n"
             "   - 「刪除」：(安全) 移除您最近一筆記錄\n"
-            "   - 「刪除 雞排」：(危險) 刪除所有含 '雞排' 的記錄\n"
-            "   - 「刪除 昨天」：(危險) 刪除所有昨天的記錄\n\n"
+            "   - 「刪除 雞排」：預覽將刪除的記錄\n"
+            "   - 「刪除 昨天」：預覽昨天的記錄\n"
+            "   - 「刪除 這週」：預覽本週的記錄\n"
+            "   - 「確認刪除」：確認執行刪除（需先預覽）\n\n"
             "💡 **預算**：\n"
             "   - 「設置預算 餐飲 3000」\n"
             "   - 「查看預算」：檢查本月預算使用情況\n\n"
@@ -257,6 +263,9 @@ def handle_message(event):
         # 3.3 刪除指令 
         elif text == "刪除":
             reply_text = handle_delete_last_record(trx_sheet, user_id)
+        # 確認刪除（模糊比對）
+        elif "確認刪除" in text or "確認" in text and "刪除" in text:
+            reply_text = handle_confirm_delete(trx_sheet, user_id, event_time)
         elif text.startswith("刪除"):
             query_text = text[2:].strip()
             if not query_text:
@@ -296,9 +305,9 @@ def handle_message(event):
 def get_datetime_from_record(r):
     """
     相容性輔助函式：
-    優先嘗試讀取 '時間' (新)，如果沒有，再讀取 '日期' (舊)
+    優先嘗試讀取 '日期' (新)，如果沒有，再讀取 '時間' (舊)
     """
-    return r.get('時間', r.get('日期', ''))
+    return r.get('日期', r.get('時間', ''))
 
 def get_cute_reply(category):
     """
@@ -954,9 +963,11 @@ def handle_delete_last_record(sheet, user_id):
 # === *** MODIFIED: handle_advanced_delete (增加標頭防錯) *** ===
 def handle_advanced_delete(sheet, user_id, query_text, event_time):
     """
-    處理進階刪除 (依關鍵字或日期)
+    預覽刪除功能：顯示即將刪除的記錄（最多顯示前 5 筆）
+    支援「今天 / 昨天 / 這週 / 上週 / 這個月」
+    超過 30 筆會顯示警告
     """
-    logger.debug(f"處理 '進階刪除' 指令，user_id: {user_id}, query: {query_text}")
+    logger.debug(f"處理 '預覽刪除' 指令，user_id: {user_id}, query: {query_text}")
     
     try:
         parsed_query = call_search_nlp(query_text, event_time)
@@ -972,7 +983,7 @@ def handle_advanced_delete(sheet, user_id, query_text, event_time):
             return f"🦝 刪除失敗：AI 無法解析您的條件「{query_text}」。"
             
     except Exception as e:
-        logger.error(f"進階刪除的 NLP 解析失敗：{e}", exc_info=True)
+        logger.error(f"預覽刪除的 NLP 解析失敗：{e}", exc_info=True)
         return f"刪除失敗：AI 分析器出錯：{str(e)}"
         
     logger.debug(f"NLP 解析結果：Keyword: {keyword}, Start: {start_date}, End: {end_date}")
@@ -985,18 +996,22 @@ def handle_advanced_delete(sheet, user_id, query_text, event_time):
             
         header = all_values[0]
         
-        # === *** 增加防錯機制 *** ===
+        # 支援 '日期' 或 '時間' 欄位（向後相容）
         try:
             idx_uid = header.index('使用者ID')
-            idx_time = header.index('時間')
+            try:
+                idx_time = header.index('日期')
+            except ValueError:
+                idx_time = header.index('時間')
             idx_cat = header.index('類別')
             idx_note = header.index('備註')
+            idx_amount = header.index('金額')
         except ValueError as e:
-            logger.error(f"進階刪除失敗：GSheet 標頭欄位名稱錯誤或缺失: {e}")
-            return "刪除失敗：找不到必要的 GSheet 欄位 (例如 '使用者ID', '時間', '類別', '備註')。請檢查 GSheet 標頭是否正確。"
-        # === *** 防錯結束 *** ===
+            logger.error(f"預覽刪除失敗：GSheet 標頭欄位名稱錯誤或缺失: {e}")
+            return "刪除失敗：找不到必要的 GSheet 欄位。請檢查 GSheet 標頭是否正確。"
         
         rows_to_delete = [] 
+        rows_info = []  # 儲存每筆記錄的詳細資訊
         
         start_dt = datetime.strptime(start_date, '%Y-%m-%d').date() if start_date else None
         end_dt = datetime.strptime(end_date, '%Y-%m-%d').date() if end_date else None
@@ -1006,7 +1021,7 @@ def handle_advanced_delete(sheet, user_id, query_text, event_time):
         for row_index in range(1, len(all_values)):
             row = all_values[row_index]
             
-            if len(row) <= max(idx_uid, idx_time, idx_cat, idx_note):
+            if len(row) <= max(idx_uid, idx_time, idx_cat, idx_note, idx_amount):
                 continue
             
             if row[idx_uid] != user_id:
@@ -1032,12 +1047,88 @@ def handle_advanced_delete(sheet, user_id, query_text, event_time):
             
             if keyword_match and date_match:
                 rows_to_delete.append(row_index + 1)
+                # 儲存記錄資訊（日期、類別、金額、備註）
+                rows_info.append({
+                    'date': record_datetime_str[:10] if record_datetime_str else 'N/A',
+                    'category': row[idx_cat] if len(row) > idx_cat else 'N/A',
+                    'amount': row[idx_amount] if len(row) > idx_amount else '0',
+                    'notes': row[idx_note] if len(row) > idx_note else 'N/A'
+                })
         
         if not rows_to_delete:
             return f"🦝 找不到符合「{nlp_message}」的記錄可供刪除。"
         
-        logger.info(f"準備從後往前刪除 {len(rows_to_delete)} 行: {rows_to_delete}")
+        # 總筆數
+        total_count = len(rows_to_delete)
         
+        # 如果有超過 30 筆，顯示警告
+        warning_msg = ""
+        if total_count > 30:
+            warning_msg = f"\n\n⚠️ 警告！您即將刪除 {total_count} 筆記錄，數量較多，請確認無誤！"
+        
+        # 構建預覽訊息（最多顯示前 5 筆）
+        preview_msg = f"🗑️ **刪除預覽** - 「{nlp_message}」\n\n"
+        preview_msg += f"📊 找到 {total_count} 筆記錄：\n\n"
+        
+        display_count = min(5, total_count)
+        for i in range(display_count):
+            info = rows_info[i]
+            try:
+                amount_val = float(info['amount']) if info['amount'] else 0
+                preview_msg += f"{i+1}. {info['date']} {info['notes']} ({info['category']}) {abs(amount_val):.0f} 元\n"
+            except (ValueError, TypeError):
+                preview_msg += f"{i+1}. {info['date']} {info['notes']} ({info['category']})\n"
+        
+        if total_count > 5:
+            preview_msg += f"\n... (還有 {total_count - 5} 筆未顯示)\n"
+        
+        preview_msg += warning_msg
+        preview_msg += f"\n💡 確認刪除請輸入：「確認刪除」"
+        
+        # 將刪除目標存入暫存（5 分鐘內有效）
+        delete_preview_cache[user_id] = {
+            'rows': rows_to_delete,
+            'timestamp': event_time,
+            'message': preview_msg
+        }
+        
+        logger.info(f"預覽刪除：找到 {total_count} 筆記錄，已暫存至 cache")
+        
+        return preview_msg
+        
+    except Exception as e:
+        logger.error(f"預覽刪除失敗：{e}", exc_info=True)
+        return f"預覽刪除失敗：{str(e)}"
+
+def handle_confirm_delete(sheet, user_id, event_time):
+    """
+    確認刪除功能：模糊比對「確認刪除」
+    僅能刪除使用者自己剛預覽的紀錄（5 分鐘內有效）
+    """
+    logger.debug(f"處理 '確認刪除' 指令，user_id: {user_id}")
+    
+    # 檢查是否有預覽暫存
+    if user_id not in delete_preview_cache:
+        return "🦝 您還沒有預覽任何刪除記錄喔！\n請先使用「刪除」指令查看要刪除的內容。"
+    
+    cache_data = delete_preview_cache[user_id]
+    cache_time = cache_data['timestamp']
+    
+    # 檢查是否在 5 分鐘內（使用 event_time 作為當前時間）
+    time_diff = event_time - cache_time
+    if time_diff.total_seconds() > 300:  # 5 分鐘 = 300 秒
+        # 過期，清除暫存
+        del delete_preview_cache[user_id]
+        return "⏰ 您的預覽已過期（超過 5 分鐘），請重新使用「刪除」指令預覽。"
+    
+    rows_to_delete = cache_data['rows']
+    
+    if not rows_to_delete:
+        del delete_preview_cache[user_id]
+        return "🦝 暫存中沒有可刪除的記錄。"
+    
+    try:
+        # 從後往前刪除（避免行號變動）
         deleted_count = 0
         for row_num in sorted(rows_to_delete, reverse=True):
             try:
@@ -1045,12 +1136,20 @@ def handle_advanced_delete(sheet, user_id, query_text, event_time):
                 deleted_count += 1
             except Exception as e:
                 logger.error(f"刪除第 {row_num} 行失敗: {e}")
-                
-        return f"🗑️ 刪除完成！\n共刪除了 {deleted_count} 筆關於「{nlp_message}」的記錄。"
-
+        
+        # 清除暫存
+        del delete_preview_cache[user_id]
+        
+        logger.info(f"確認刪除成功：共刪除 {deleted_count} 筆記錄")
+        
+        return f"✅ **刪除完成！**\n\n共刪除了 {deleted_count} 筆記錄。"
+        
     except Exception as e:
-        logger.error(f"進階刪除失敗：{e}", exc_info=True)
-        return f"刪除記錄失敗：{str(e)}"
+        logger.error(f"確認刪除失敗：{e}", exc_info=True)
+        # 清除暫存（即使刪除失敗）
+        if user_id in delete_preview_cache:
+            del delete_preview_cache[user_id]
+        return f"刪除記錄時發生錯誤：{str(e)}"
 
 def handle_set_budget(sheet, text, user_id):
     """
