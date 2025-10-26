@@ -11,9 +11,6 @@ from linebot.exceptions import InvalidSignatureError, LineBotApiError
 from linebot.models import MessageEvent, TextMessage, TextSendMessage
 from google.oauth2.service_account import Credentials
 from datetime import datetime, timedelta, date
-
-# === 修正： dotenv import ===
-# 確保這一行存在，並且你已經透過 pip install python-dotenv 安裝了它
 from dotenv import load_dotenv
 
 # === 配置日誌 ===
@@ -50,7 +47,7 @@ try:
     line_bot_api = LineBotApi(LINE_CHANNEL_ACCESS_TOKEN)
     
     genai.configure(api_key=GEMINI_API_KEY)
-    gemini_model = genai.GenerativeModel('gemini-2.5-flash-lite')
+    gemini_model = genai.GenerativeModel('gemini-1.5-flash-latest') # 建議使用 1.5-flash
     
     logger.debug("LINE 和 Gemini API 客戶端初始化成功")
 except Exception as e:
@@ -150,13 +147,13 @@ def webhook():
     return 'OK'
 
 # === 訊息總機 (核心邏輯) ===
-# === MODIFIED: handle_message (簡化路由器) ===
 @handler.add(MessageEvent, message=TextMessage)
 def handle_message(event):
     text = event.message.text.strip()
     reply_token = event.reply_token
     user_id = event.source.user_id
     line_timestamp_ms = event.timestamp
+    # event_time 就是「傳送時間」
     event_time = datetime.fromtimestamp(line_timestamp_ms / 1000.0)
     
     logger.debug(f"Received message: '{text}' from user '{user_id}' at {event_time}")
@@ -168,7 +165,9 @@ def handle_message(event):
             "💸 **自然記帳** (AI會幫你分析)：\n"
             "   - 「今天中午吃了雞排80」\n"
             "   - 「昨天喝飲料 50」\n"
-            "   - 「午餐100 晚餐200」\n\n"
+            "   - 「16:22 買零食 100」\n"
+            "   - 「午餐100 晚餐200」\n"
+            "   - 「水果條59x2 + 奶茶35」\n\n"
             "📊 **分析查詢**：\n"
             "   - 「查帳」：查看總支出、收入和淨餘額\n"
             "   - 「月結」：分析這個月的收支總結\n"
@@ -186,7 +185,9 @@ def handle_message(event):
             "   - 「刪除 昨天」：(危險) 刪除所有昨天的記錄\n\n"
             "💡 **預算**：\n"
             "   - 「設置預算 餐飲 3000」\n"
-            "   - 「查看預算」：檢查本月預算使用情況\n"
+            "   - 「查看預算」：檢查本月預算使用情況\n\n"
+            "ℹ️ **其他**：\n"
+            "   - 「有哪些類別？」：查看所有記帳項目\n"
             " 類別: 🍽️ 餐飲 🥤 飲料 🚌 交通 🎬 娛樂 🛍️ 購物 💡 雜項💰 收入"
         )
         
@@ -266,6 +267,7 @@ def handle_message(event):
         # 3.5 預設：NLP 自然語言處理 (記帳, 閒聊, 分析查詢)
         else:
             user_name = get_user_profile_name(user_id)
+            # 把「傳送時間」 event_time 傳下去
             reply_text = handle_nlp_record(trx_sheet, budget_sheet, text, user_id, user_name, event_time)
 
     except Exception as e:
@@ -400,19 +402,22 @@ def check_budget_warning(trx_sheet, budget_sheet, user_id, category, event_time)
         logger.error(f"檢查預算警告失敗：{e}", exc_info=True)
         return "\n(檢查預算時發生錯誤)"
 
-# === MODIFIED: NLP Prompt (新增 "query" 狀態, 優化 "chat" 語氣) ===
+# === *** MODIFIED: handle_nlp_record (強力修正時間規則) *** ===
 def handle_nlp_record(sheet, budget_sheet, text, user_id, user_name, event_time):
     """
-    使用 Gemini NLP 處理自然語言記帳 (記帳、聊天、查詢)
+    使用 Gemini NLP 處理自然語言記帳 (記帳、聊天、查詢、系統問題)
+    event_time 是使用者「傳送訊息」的準確時間。
     """
     logger.debug(f"處理自然語言記帳指令：{text}")
     
+    # current_time_str 現在代表「使用者傳送訊息的時間」
     current_time_str = event_time.strftime('%Y-%m-%d %H:%M:%S')
     today_str = event_time.strftime('%Y-%m-%d')
     
     date_context_lines = [
         f"今天是 {today_str} (星期{event_time.weekday()})。",
-        f"目前時間是: {event_time.strftime('%H:%M:%S')}",
+        # 這裡的 "目前時間" 就是 "傳送時間"
+        f"使用者傳送時間是: {event_time.strftime('%H:%M:%S')}",
         "日期參考：",
         f"- 昨天: {(event_time.date() - timedelta(days=1)).strftime('%Y-%m-%d')}"
     ]
@@ -424,10 +429,12 @@ def handle_nlp_record(sheet, budget_sheet, text, user_id, user_name, event_time)
     
     目前的日期時間上下文如下：
     {date_context}
+    
+    **使用者的「傳送時間」是 {current_time_str}**。
 
     請嚴格按照以下 JSON 格式回傳，不要有任何其他文字或 "```json" 標記：
     {{
-      "status": "success" | "failure" | "chat" | "query",
+      "status": "success" | "failure" | "chat" | "query" | "system_query",
       "data": [
         {{
           "datetime": "YYYY-MM-DD HH:MM:SS",
@@ -442,36 +449,43 @@ def handle_nlp_record(sheet, budget_sheet, text, user_id, user_name, event_time)
     解析規則：
     1. status "success": 如果成功解析為記帳 (包含一筆或多筆)。
         - data: 必須是一個 "列表" (List)，包含一或多個記帳物件。
-        - **時間規則**:
-            - 沒提日期 (例如 "雞排 80")，預設為當下時間 ({current_time_str})。
-            - 只提日期 (例如 "昨天 50")，預設時間為 "12:00:00" (中午)。
-            - "早餐" 預設 08:00:00。
-            - "午餐" 預設 12:00:00。
-            - "晚餐" 預設 18:00:00。
-            - "宵夜" 預設 23:00:00。
+        - **多筆記帳**: 如果使用者一次輸入多筆 (例如 "午餐100 晚餐200")，"data" 列表中必須包含 *多個* 物件。
+        
+        - **時間規則 (非常重要！請嚴格遵守！)**:
+            - **(規則 1) 顯式時間 (最高優先)**: 如果使用者 "明確" 提到 "日期" (例如 "昨天", "10/25") 或 "時間" (例如 "16:22", "晚上7點")，**必須** 優先解析並使用該時間。
+            - **(規則 2) 預設為傳送時間 (次高優先)**: 如果 "規則 1" 不適用 (即使用者 "沒有" 提到明確日期或時間，例如輸入 "雞排 80", "零食 50")，**必須** 使用使用者的「傳送時間」，即 **{current_time_str}**。
+            - **(規則 3) 時段關鍵字 (僅供參考)**: 
+                - 如果使用者輸入 "早餐 50"，且「傳送時間」是 09:30，則判斷為補記帳，使用 {today_str} 08:00:00。
+                - 如果使用者輸入 "午餐 100"，且「傳送時間」是 14:00，則判斷為補記帳，使用 {today_str} 12:00:00。
+                - 如果使用者輸入 "下午茶 100"，且「傳送時間」是 19:36，**此時「傳送時間」(19:36) 與 "下午茶" (15:00) 差距過大，應判斷 "下午茶" 只是「備註」，套用 "規則 2"，必須使用 {current_time_str}**。
+                - "晚餐" (18:00), "宵夜" (23:00) 邏輯同上。
+
         - category: 必須是 [餐飲, 飲料, 交通, 娛樂, 購物, 雜項, 收入] 之一。
         - amount: 支出必須為負數 (-)，收入必須為正數 (+)。
         - notes: 盡可能擷取出花費的項目。
         - message: "記錄成功" (此欄位在 success 時不重要)
 
     2. status "chat": 如果使用者只是在閒聊 (例如 "你好", "你是誰", "謝謝")。
-        - data: null
-        - message: (請用「記帳小浣熊🦝」的語氣，"活潑"、"可愛"、"隨機"地友善回覆，避免重複。例如：「哈囉！我是記帳小浣熊🦝 需要幫忙記帳嗎？」、「找我嗎？(ゝ∀･)b」、「浣熊來囉！(≧▽≦)」)
-    
-    3. status "query": 如果使用者在 "詢問" 關於他帳務的問題 (但不是 "查詢" 指令)。
-        - data: null
-        - message: (使用者的原始問題，例如 "我本月花太多嗎？")
-    
-    4. status "failure": 如果看起來像記帳，但缺少關鍵資訊 (例如 "雞排" (沒說金額))。
-        - data: null
-        - message: "🦝？我不太確定... 麻煩請提供日期和金額喔！"
+    3. status "query": 如果使用者在 "詢問" 關於他帳務的問題 (例如 "我本月花太多嗎？")。
+    4. status "system_query": 如果使用者在詢問 "系統功能" 或 "有哪些類別"。
+    5. status "failure": 如果看起來像記帳，但缺少關鍵資訊 (例如 "雞排" (沒說金額))。
     
     範例：
-    輸入: "今天中午吃了雞排80" -> {{"status": "success", "data": [{{"datetime": "{today_str} 12:00:00", "category": "餐飲", "amount": -80, "notes": "雞排"}}], "message": "記錄成功"}}
-    輸入: "早餐 50" -> {{"status": "success", "data": [{{"datetime": "{today_str} 08:00:00", "category": "餐飲", "amount": -50, "notes": "早餐"}}], "message": "記錄成功"}}
+    輸入: "今天中午吃了雞排80" (規則 1) -> {{"status": "success", "data": [{{"datetime": "{today_str} 12:00:00", "category": "餐飲", "amount": -80, "notes": "雞排"}}], "message": "記錄成功"}}
+    輸入: "午餐100 晚餐200" (規則 3) -> {{"status": "success", "data": [{{"datetime": "{today_str} 12:00:00", "category": "餐飲", "amount": -100, "notes": "午餐"}}, {{"datetime": "{today_str} 18:00:00", "category": "餐飲", "amount": -200, "notes": "晚餐"}}], "message": "記錄成功"}}
+    輸入: "ACE水果條59x2+龜甲萬豆乳紅茶35" (規則 2) -> {{"status": "success", "data": [{{"datetime": "{current_time_str}", "category": "購物", "amount": -118, "notes": "ACE水果條 59x2"}}, {{"datetime": "{current_time_str}", "category": "飲料", "amount": -35, "notes": "龜甲萬豆乳紅茶"}}], "message": "記錄成功"}}
+    輸入: "16:22 記帳零食 50" (規則 1) -> {{"status": "success", "data": [{{"datetime": "{today_str} 16:22:00", "category": "雜項", "amount": -50, "notes": "零食"}}], "message": "記錄成功"}}
+    
+    **重要範例 (使用者回報的錯誤，假設 {current_time_str} 就是使用者提到的時間)**:
+    輸入: "記帳零食 50" (假設 {current_time_str} 是 "2025-10-26 16:22:10") (規則 2)
+    -> {{"status": "success", "data": [{{"datetime": "2025-10-26 16:22:10", "category": "雜項", "amount": -50, "notes": "零食"}}], "message": "記錄成功"}}
+    
+    輸入: "下午茶 100" (假設 {current_time_str} 是 "2025-10-26 19:36:00") (規則 3 判斷為備註 -> 套用規則 2)
+    -> {{"status": "success", "data": [{{"datetime": "2025-10-26 19:36:00", "category": "餐飲", "amount": -100, "notes": "下午茶"}}], "message": "記錄成功"}}
+
     輸入: "你好" -> {{"status": "chat", "data": null, "message": "哈囉！我是記帳小浣熊🦝 需要幫忙記帳嗎？還是想聊聊天呀？"}}
     輸入: "我本月花太多嗎？" -> {{"status": "query", "data": null, "message": "我本月花太多嗎？"}}
-    輸入: "我還剩多少預算" -> {{"status": "query", "data": null, "message": "我還剩多少預算"}}
+    輸入: "目前有什麼項目?" -> {{"status": "system_query", "data": null, "message": "請問您是指記帳的「類別」嗎？ 🦝\n預設類別有：🍽️ 餐飲 🥤 飲料 🚌 交通 🎬 娛樂 🛍️ 購物 💡 雜項 💰 收入"}}
     輸入: "宵夜" -> {{"status": "failure", "data": null, "message": "🦝？ 宵夜吃了什麼？花了多少錢呢？"}}
     """
     
@@ -485,7 +499,7 @@ def handle_nlp_record(sheet, budget_sheet, text, user_id, user_name, event_time)
         status = data.get('status')
         message = data.get('message')
 
-        # === MODIFIED: handle_nlp_record (新增 query 狀態處理) ===
+        # === MODIFIED: handle_nlp_record (處理 success, system_query, query, chat, failure) ===
         if status == 'success':
             records = data.get('data', [])
             if not records:
@@ -495,6 +509,7 @@ def handle_nlp_record(sheet, budget_sheet, text, user_id, user_name, event_time)
             last_category = "雜項" 
             
             for record in records:
+                # AI 回傳的時間字串
                 datetime_str = record.get('datetime', current_time_str)
                 category = record.get('category', '雜項')
                 amount_str = record.get('amount', 0)
@@ -546,6 +561,11 @@ def handle_nlp_record(sheet, budget_sheet, text, user_id, user_name, event_time)
         elif status == 'chat':
             # AI 會回傳隨機的可愛訊息
             return message or "你好！我是記帳小浣熊 🦝"
+        
+        # === *** NEW: 處理 system_query 狀態 *** ===
+        elif status == 'system_query':
+            # AI 應該已經根據 prompt 生成了完整的回答
+            return message or "我可以幫您記帳！ 🦝 預設類別有：餐飲, 飲料, 交通, 娛樂, 購物, 雜項, 收入。"
         
         elif status == 'query':
             # AI 偵測到使用者在 "詢問"
@@ -785,8 +805,8 @@ def handle_total_analysis(sheet, user_id):
         
         return reply
     except Exception as e:
-        logger.error(f"總收支分析失敗：{e}", exc_info=True)
-        return f"總收支分析報表產生失敗：{str(e)}"
+        logger.error(f"總收支分析失败：{e}", exc_info=True)
+        return f"總收支分析報表產生失败：{str(e)}"
 
 
 def handle_delete_last_record(sheet, user_id):
@@ -797,6 +817,9 @@ def handle_delete_last_record(sheet, user_id):
     try:
         all_values = sheet.get_all_values()
         
+        if not all_values:
+            return "您的帳本是空的，沒有記錄可刪除。"
+            
         header = all_values[0]
         try:
             user_id_col_index = header.index('使用者ID')
@@ -823,6 +846,7 @@ def handle_delete_last_record(sheet, user_id):
         logger.error(f"刪除失敗：{e}", exc_info=True)
         return f"刪除記錄失敗：{str(e)}"
 
+# === *** MODIFIED: handle_advanced_delete (增加標頭防錯) *** ===
 def handle_advanced_delete(sheet, user_id, query_text, event_time):
     """
     處理進階刪除 (依關鍵字或日期)
@@ -850,12 +874,22 @@ def handle_advanced_delete(sheet, user_id, query_text, event_time):
 
     try:
         all_values = sheet.get_all_values()
+        
+        if not all_values:
+            return "🦝 您的帳本是空的，找不到記錄可刪除。"
+            
         header = all_values[0]
         
-        idx_uid = header.index('使用者ID')
-        idx_time = header.index('時間')
-        idx_cat = header.index('類別')
-        idx_note = header.index('備註')
+        # === *** 增加防錯機制 *** ===
+        try:
+            idx_uid = header.index('使用者ID')
+            idx_time = header.index('時間')
+            idx_cat = header.index('類別')
+            idx_note = header.index('備註')
+        except ValueError as e:
+            logger.error(f"進階刪除失敗：GSheet 標頭欄位名稱錯誤或缺失: {e}")
+            return "刪除失敗：找不到必要的 GSheet 欄位 (例如 '使用者ID', '時間', '類別', '備註')。請檢查 GSheet 標頭是否正確。"
+        # === *** 防錯結束 *** ===
         
         rows_to_delete = [] 
         
@@ -909,9 +943,6 @@ def handle_advanced_delete(sheet, user_id, query_text, event_time):
                 
         return f"🗑️ 刪除完成！\n共刪除了 {deleted_count} 筆關於「{nlp_message}」的記錄。"
 
-    except ValueError as e:
-        logger.error(f"進階刪除失敗：GSheet 欄位名稱錯誤 {e}")
-        return "刪除失敗：找不到必要的 GSheet 欄位 (例如 '使用者ID', '時間', '類別', '備註')"
     except Exception as e:
         logger.error(f"進階刪除失敗：{e}", exc_info=True)
         return f"刪除記錄失敗：{str(e)}"
@@ -1028,7 +1059,6 @@ def handle_view_budget(trx_sheet, budget_sheet, user_id, event_time):
         logger.error(f"查看預算失敗：{e}", exc_info=True)
         return f"查看預算失敗：{str(e)}"
 
-# === MODIFIED: handle_conversational_query (優化語氣) ===
 def handle_conversational_query(trx_sheet, budget_sheet, text, user_id, event_time):
     """
     處理聊天式查詢 (例如 "我還剩多少預算？", "我本月花太多嗎？")
@@ -1112,7 +1142,7 @@ def handle_conversational_query(trx_sheet, budget_sheet, text, user_id, event_ti
     # 如果 AI 判斷是 query，但我們這邊的規則都沒對上
     return random.choice([
         "🦝？ 抱歉，我不太懂您的問題... 試試看「查詢...」或「本週重點」？",
-        "嗯... (歪頭) 您的問題有點深奧，小浣熊聽不懂 😅",
+        "嗯... (歪頭) 您的問題有點深奥，小浣熊聽不懂 😅",
         "您可以問我「我本月花太多嗎？」或「我還剩多少預算？」喔！"
     ])
 
@@ -1300,14 +1330,16 @@ def call_search_nlp(query_text, event_time):
     7. 如果提到 "上禮拜" 或 "上週"，使用 {start_of_last_week.strftime('%Y-%m-%d')} 到 {end_of_last_week.strftime('%Y-%m-%d')}。
     8. 如果提到 "這個月" 或 "本月"，使用 {start_of_month.strftime('%Y-%m-%d')} 到 {today_str}。
     9. 如果提到 "上個月"，使用 {start_of_last_month.strftime('%Y-%m-%d')} 到 {last_month_end_date.strftime('%Y-%m-%d')}。
+    10. (重要) 如果關鍵字包含乘法 (例如 "龜甲萬豆乳紅茶")，請確保 keyword 欄位是精確的 (例如 "龜甲萬豆乳紅茶")。
 
     範例：
     輸入: "雞排" -> {{"status": "success", "keyword": "雞排", "start_date": null, "end_date": null, "message": "查詢關鍵字：雞排"}}
-    輸入: "這禮B拜的餐飲" -> {{"status": "success", "keyword": "餐飲", "start_date": "{start_of_week.strftime('%Y-%m-%d')}", "end_date": "{today_str}", "message": "查詢本週的餐飲"}}
+    輸入: "這禮拜的餐飲" -> {{"status": "success", "keyword": "餐飲", "start_date": "{start_of_week.strftime('%Y-%m-%d')}", "end_date": "{today_str}", "message": "查詢本週的餐飲"}}
     輸入: "幫我查上禮拜飲料花多少" -> {{"status": "success", "keyword": "飲料", "start_date": "{start_of_last_week.strftime('%Y-%m-%d')}", "end_date": "{end_of_last_week.strftime('%Y-%m-%d')}", "message": "查詢上禮拜的飲料"}}
     輸入: "上個月" -> {{"status": "success", "keyword": null, "start_date": "{start_of_last_month.strftime('%Y-%m-%d')}", "end_date": "{last_month_end_date.strftime('%Y-%m-%d')}", "message": "查詢上個月的記錄"}}
-    輸入: "10/1 到 10/10" -> {{"status": "success", "keyword": null, "start_date": "{today.year}-10-01", "end_date": "{today.year}-10-10", "message": "查詢 10/1 到 10/10"}}
+    輸入: "10/1 到 10/10" -> {{"status": "success", "keyword": null, "start_date": "{today.year}-10-01", "end_date": "{today.year}-10-10", "message": "查詢 10/ 到 10/10"}}
     輸入: "昨天" -> {{"status": "success", "keyword": null, "start_date": "{(today - timedelta(days=1)).strftime('%Y-%m-%d')}", "end_date": "{(today - timedelta(days=1)).strftime('%Y-%m-%d')}", "message": "查詢昨天的記錄"}}
+    輸入: "龜甲萬豆乳紅茶" -> {{"status": "success", "keyword": "龜甲萬豆乳紅茶", "start_date": null, "end_date": null, "message": "查詢關鍵字：龜甲萬豆乳紅茶"}}
     """
 
     try:
