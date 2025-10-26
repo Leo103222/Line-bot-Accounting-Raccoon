@@ -1056,7 +1056,7 @@ def handle_advanced_delete(sheet, user_id, query_text, event_time):
                 })
         
         if not rows_to_delete:
-            return f"🦝 找不到符合「{nlp_message}」的記錄可供刪除。"
+            return f"🦝 嘿～找不到符合「{nlp_message}」的記錄呢～\n請確認一下條件是否有誤喔！"
         
         # 總筆數
         total_count = len(rows_to_delete)
@@ -1068,22 +1068,22 @@ def handle_advanced_delete(sheet, user_id, query_text, event_time):
         
         # 構建預覽訊息（最多顯示前 5 筆）
         preview_msg = f"🗑️ **刪除預覽** - 「{nlp_message}」\n\n"
-        preview_msg += f"📊 找到 {total_count} 筆記錄：\n\n"
+        preview_msg += f"📊 小浣熊找到 {total_count} 筆記錄囉～\n\n"
         
         display_count = min(5, total_count)
         for i in range(display_count):
             info = rows_info[i]
             try:
                 amount_val = float(info['amount']) if info['amount'] else 0
-                preview_msg += f"{i+1}. {info['date']} {info['notes']} ({info['category']}) {abs(amount_val):.0f} 元\n"
+                preview_msg += f"  {i+1}. {info['date']} {info['notes']} ({info['category']}) {abs(amount_val):.0f} 元\n"
             except (ValueError, TypeError):
-                preview_msg += f"{i+1}. {info['date']} {info['notes']} ({info['category']})\n"
+                preview_msg += f"  {i+1}. {info['date']} {info['notes']} ({info['category']})\n"
         
         if total_count > 5:
-            preview_msg += f"\n... (還有 {total_count - 5} 筆未顯示)\n"
+            preview_msg += f"\n    ... (還有 {total_count - 5} 筆未顯示) ...\n"
         
         preview_msg += warning_msg
-        preview_msg += f"\n💡 確認刪除請輸入：「確認刪除」"
+        preview_msg += f"\n\n💡 確認刪除請輸入：「確認刪除」🦝"
         
         # 將刪除目標存入暫存（5 分鐘內有效）
         delete_preview_cache[user_id] = {
@@ -1109,7 +1109,7 @@ def handle_confirm_delete(sheet, user_id, event_time):
     
     # 檢查是否有預覽暫存
     if user_id not in delete_preview_cache:
-        return "🦝 您還沒有預覽任何刪除記錄喔！\n請先使用「刪除」指令查看要刪除的內容。"
+        return "🦝 嘿～您還沒有預覽任何記錄呢！\n請先使用「刪除」指令查看要刪除的內容喔～"
     
     cache_data = delete_preview_cache[user_id]
     cache_time = cache_data['timestamp']
@@ -1119,13 +1119,13 @@ def handle_confirm_delete(sheet, user_id, event_time):
     if time_diff.total_seconds() > 300:  # 5 分鐘 = 300 秒
         # 過期，清除暫存
         del delete_preview_cache[user_id]
-        return "⏰ 您的預覽已過期（超過 5 分鐘），請重新使用「刪除」指令預覽。"
+        return "⏰ 哎呀！您的預覽已經過期囉（超過 5 分鐘）\n請重新使用「刪除」指令預覽～～ 🦝"
     
     rows_to_delete = cache_data['rows']
     
     if not rows_to_delete:
         del delete_preview_cache[user_id]
-        return "🦝 暫存中沒有可刪除的記錄。"
+        return "🦝 嗯...暫存中沒有記錄可以刪除耶～"
     
     try:
         # 從後往前刪除（避免行號變動）
@@ -1142,7 +1142,7 @@ def handle_confirm_delete(sheet, user_id, event_time):
         
         logger.info(f"確認刪除成功：共刪除 {deleted_count} 筆記錄")
         
-        return f"✅ **刪除完成！**\n\n共刪除了 {deleted_count} 筆記錄。"
+        return f"✅ **刪除完成！** ✨\n\n小浣熊已經幫您刪除了 {deleted_count} 筆記錄囉～ 🦝"
         
     except Exception as e:
         logger.error(f"確認刪除失敗：{e}", exc_info=True)
