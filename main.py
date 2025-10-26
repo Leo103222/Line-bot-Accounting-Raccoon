@@ -47,7 +47,7 @@ try:
     line_bot_api = LineBotApi(LINE_CHANNEL_ACCESS_TOKEN)
     
     genai.configure(api_key=GEMINI_API_KEY)
-    gemini_model = genai.GenerativeModel('gemini-1.5-flash-latest') # 建議使用 1.5-flash
+    gemini_model = genai.GenerativeModel('gemini-2.5-flash-lite')
     
     logger.debug("LINE 和 Gemini API 客戶端初始化成功")
 except Exception as e:
