@@ -1550,7 +1550,7 @@ def call_search_nlp(query_text, event_time):
     except Exception as e:
         logger.error(f"Gemini Search API 呼叫失敗: {e}", exc_info=True)
         return {"status": "failure", "message": f"AI 分析器 API 呼叫失敗: {e}"}
-
+#喵
 # === 主程式入口 ===
 if __name__ == "__main__":
     logger.info("Starting Flask server locally...")
