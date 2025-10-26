@@ -410,6 +410,78 @@ def check_budget_warning(trx_sheet, budget_sheet, user_id, category, event_time)
         return "\n(檢查預算時發生錯誤)"
 
 # === *** MODIFIED: handle_nlp_record (強力修正時間規則) *** ===
+# === 加法/乘法 表達式解析與合併（本地保險機制） ===
+import math
+
+def _parse_amount_expr(expr: str):
+    """
+    嘗試解析簡單的金額運算字串，支援：
+      - 加法：180+60+135
+      - 乘法：59x2、59*2（大小寫 x/X）
+      - 混合：59x2+35、100+20*3
+    僅允許數字、+、-、*、x/X、空白與小數點。
+    解析失敗回傳 None。
+    """
+    try:
+        # 標準化：x/X -> *、全形＋ -> +（保守處理）
+        expr_std = expr.replace('x', '*').replace('X', '*').replace('＋', '+').replace('－', '-').replace('＊', '*')
+        if re.fullmatch(r"[0-9\.\+\-\*\s]+", expr_std):
+            # 安全評估：僅算術；不允許 //、** 等進階運算，若出現會在 fullmatch 被擋
+            return eval(expr_std, {"__builtins__": {}}, {})
+    except Exception:
+        pass
+    return None
+
+def _try_collapse_add_expr_from_text(original_text: str, records: list):
+    """
+    嘗試判斷輸入是否像「晚餐180+60+135」這種單一品項的加法表達，
+    若 AI 回傳多筆同類別記錄，則合併為一筆。
+    合併策略：
+      1) 從原始文字抓第一段「非數字 prefix」與緊接的「金額表達式」。
+      2) 若偵測到 A+B(+C...)，或含乘法的片段，試著運算。
+      3) 若 records>=2 且多筆類別相同，則合併為一筆：
+         - datetime 用第一筆
+         - category 用第一筆
+         - amount 的正負依原 records 的符號為準（多數決；預設支出）
+         - notes 使用 prefix（去掉結尾空白）
+    回傳 (collapsed_records, did_collapse: bool)
+    """
+    text = original_text.strip()
+    # 找到第一個數字的位置，將前面的當 notes 前綴
+    m = re.search(r"\d", text)
+    if not m:
+        return records, False
+
+    prefix = text[:m.start()].strip()  # 例如「晚餐」
+    tail = text[m.start():]            # 例如「180+60+135」或「59x2+35」
+
+    # 僅在 tail 符合「運算表達式」時才嘗試
+    val = _parse_amount_expr(tail)
+    if val is None:
+        return records, False
+
+    # 當 AI 已經回傳單筆就不管；多筆時才合併
+    if len(records) < 2:
+        return records, False
+
+    # 檢查多筆是否為同類別（寬鬆）：
+    cats = [r.get("category", "") for r in records]
+    same_cat = len(set(cats)) == 1
+
+    if not same_cat:
+        return records, False
+
+    # 多數決決定正負（若含正負混雜，預設支出為負數）
+    signs = [1 if float(r.get("amount", 0)) > 0 else -1 for r in records]
+    sign = 1 if signs.count(1) > signs.count(-1) else -1
+
+    collapsed = [{
+        "datetime": records[0].get("datetime"),
+        "category": records[0].get("category"),
+        "amount": float(val) * sign,
+        "notes": prefix or records[0].get("notes", "")
+    }]
+    return collapsed, True
 def handle_nlp_record(sheet, budget_sheet, text, user_id, user_name, event_time):
     """
     使用 Gemini NLP 處理自然語言記帳 (記帳、聊天、查詢、系統問題)
@@ -478,6 +550,13 @@ def handle_nlp_record(sheet, budget_sheet, text, user_id, user_name, event_time)
     5. status "failure": 如果看起來像記帳，但缺少關鍵資訊 (例如 "雞排" (沒說金額))。
     
     範例：
+
+    ⚠️ 規則補充：
+    - 如果使用者輸入金額中有「+」或「x/＊」符號（例如 "晚餐180+60+135"、"飲料59x2"），
+      請將它們視為「單一筆記帳」的運算表達式，**計算總和**後輸出一筆金額，而不是拆成多筆。
+      例如：
+      輸入: "晚餐180+60+135" -> {"status": "success", "data": [{"datetime": "{today_str} 18:00:00", "category": "餐飲", "amount": -375, "notes": "晚餐"}], "message": "記錄成功"}
+      輸入: "飲料59x2" -> {"status": "success", "data": [{"datetime": "{current_time_str}", "category": "飲料", "amount": -118, "notes": "飲料"}], "message": "記錄成功"}
     輸入: "今天中午吃了雞排80" (規則 1) -> {{"status": "success", "data": [{{"datetime": "{today_str} 12:00:00", "category": "餐飲", "amount": -80, "notes": "雞排"}}], "message": "記錄成功"}}
     輸入: "午餐100 晚餐200" (規則 3) -> {{"status": "success", "data": [{{"datetime": "{today_str} 12:00:00", "category": "餐飲", "amount": -100, "notes": "午餐"}}, {{"datetime": "{today_str} 18:00:00", "category": "餐飲", "amount": -200, "notes": "晚餐"}}], "message": "記錄成功"}}
     輸入: "ACE水果條59x2+龜甲萬豆乳紅茶35" (規則 2) -> {{"status": "success", "data": [{{"datetime": "{current_time_str}", "category": "購物", "amount": -118, "notes": "ACE水果條 59x2"}}, {{"datetime": "{current_time_str}", "category": "飲料", "amount": -35, "notes": "龜甲萬豆乳紅茶"}}], "message": "記錄成功"}}
@@ -509,6 +588,12 @@ def handle_nlp_record(sheet, budget_sheet, text, user_id, user_name, event_time)
         # === MODIFIED: handle_nlp_record (處理 success, system_query, query, chat, failure) ===
         if status == 'success':
             records = data.get('data', [])
+
+            # 嘗試合併像「晚餐180+60+135」這類被誤拆的多筆紀錄
+            try:
+                records, _did = _try_collapse_add_expr_from_text(text, records)
+            except Exception as _e:
+                logger.warning(f"合併加法表達式失敗：{_e}")
             if not records:
                 return "🦝？ AI 分析成功，但沒有返回任何記錄。"
             
@@ -1340,6 +1425,13 @@ def call_search_nlp(query_text, event_time):
     10. (重要) 如果關鍵字包含乘法 (例如 "龜甲萬豆乳紅茶")，請確保 keyword 欄位是精確的 (例如 "龜甲萬豆乳紅茶")。
 
     範例：
+
+    ⚠️ 規則補充：
+    - 如果使用者輸入金額中有「+」或「x/＊」符號（例如 "晚餐180+60+135"、"飲料59x2"），
+      請將它們視為「單一筆記帳」的運算表達式，**計算總和**後輸出一筆金額，而不是拆成多筆。
+      例如：
+      輸入: "晚餐180+60+135" -> {"status": "success", "data": [{"datetime": "{today_str} 18:00:00", "category": "餐飲", "amount": -375, "notes": "晚餐"}], "message": "記錄成功"}
+      輸入: "飲料59x2" -> {"status": "success", "data": [{"datetime": "{today_str} 12:00:00", "category": "飲料", "amount": -118, "notes": "飲料"}], "message": "記錄成功"}
     輸入: "雞排" -> {{"status": "success", "keyword": "雞排", "start_date": null, "end_date": null, "message": "查詢關鍵字：雞排"}}
     輸入: "這禮拜的餐飲" -> {{"status": "success", "keyword": "餐飲", "start_date": "{start_of_week.strftime('%Y-%m-%d')}", "end_date": "{today_str}", "message": "查詢本週的餐飲"}}
     輸入: "幫我查上禮拜飲料花多少" -> {{"status": "success", "keyword": "飲料", "start_date": "{start_of_last_week.strftime('%Y-%m-%d')}", "end_date": "{end_of_last_week.strftime('%Y-%m-%d')}", "message": "查詢上禮拜的飲料"}}
