@@ -222,25 +222,30 @@ def handle_message(event):
         return
         
     # === 3. 指令路由器 (Router) ===
-    # 我們把 "明確" 的指令放前面
+    # "明確" 的指令放前面
     try:
         # 3.1 基礎指令
-        if text == "查帳":
+        if text == "查帳": # "查帳" 保持 == 即可
             reply_text = handle_check_balance(trx_sheet, user_id)
-        elif text == "月結":
+        
+        elif text.startswith("月結"): # 月結
             reply_text = handle_monthly_report(trx_sheet, user_id, event_time)
-        elif text == "本週重點":
+        
+        # === 關鍵修正：同時檢查 "週" 和 "周" ===
+        elif text.startswith("本週重點") or text.startswith("本周重點"):
             reply_text = handle_weekly_report(trx_sheet, user_id, event_time)
-        elif text == "總收支分析":
+        
+        elif text.startswith("總收支分析"): # 總收支分析
             reply_text = handle_total_analysis(trx_sheet, user_id)
         
-        # 3.2 預算指令 (用 startswith 確保優先)
+        # 3.2 預算指令 
         elif text.startswith("設置預算"):
             reply_text = handle_set_budget(budget_sheet, text, user_id)
-        elif text == "查看預算":
+        
+        elif text.startswith("查看預算"): 
             reply_text = handle_view_budget(trx_sheet, budget_sheet, user_id, event_time)
         
-        # 3.3 刪除指令 (用 startswith 確保優先)
+        # 3.3 刪除指令 
         elif text == "刪除":
             reply_text = handle_delete_last_record(trx_sheet, user_id)
         elif text.startswith("刪除"):
@@ -250,7 +255,7 @@ def handle_message(event):
             else:
                 reply_text = handle_advanced_delete(trx_sheet, user_id, query_text, event_time)
                 
-        # 3.4 查詢指令 (用 startswith 確保優先)
+        # 3.4 查詢指令 
         elif text.startswith("查詢"):
             keyword = text[2:].strip()
             if not keyword:
@@ -259,10 +264,8 @@ def handle_message(event):
                 reply_text = handle_search_records(trx_sheet, user_id, keyword, event_time)
 
         # 3.5 預設：NLP 自然語言處理 (記帳, 閒聊, 分析查詢)
-        # (我們移除了 'elif text.startswith("我")...'，因為 AI 會處理)
         else:
             user_name = get_user_profile_name(user_id)
-            # handle_nlp_record 現在會自動判斷是 記帳(success), 閒聊(chat) 還是 分析(query)
             reply_text = handle_nlp_record(trx_sheet, budget_sheet, text, user_id, user_name, event_time)
 
     except Exception as e:
