@@ -15,6 +15,29 @@ from dotenv import load_dotenv
 from zoneinfo import ZoneInfo
 from string import Template
 
+# === 自訂：常見關鍵字 → 類別 規則（覆蓋 AI 分類） ===
+# 只要備註中包含這些詞，就強制歸到對應類別。
+CUSTOM_CATEGORY_RULES = {
+    # 餐飲（主食/小吃/水果亦視為餐飲）
+    "早餐": "餐飲", "午餐": "餐飲", "晚餐": "餐飲", "宵夜": "餐飲",
+    "飯": "餐飲", "麵": "餐飲", "水餃": "餐飲", "滷味": "餐飲", "便當": "餐飲",
+    "雞排": "餐飲", "鹽酥雞": "餐飲", "滷肉飯": "餐飲", "牛肉麵": "餐飲",
+    "漢堡": "餐飲", "薯條": "餐飲", "披薩": "餐飲", "咖哩": "餐飲",
+    "蛋餅": "餐飲", "蘿蔔糕": "餐飲", "關東煮": "餐飲",
+    # 水果常被誤分到雜項，統一歸餐飲
+    "香蕉": "餐飲", "蘋果": "餐飲", "芭樂": "餐飲", "葡萄": "餐飲",
+    "柳丁": "餐飲", "橘子": "餐飲", "西瓜": "餐飲", "木瓜": "餐飲",
+    "鳳梨": "餐飲", "草莓": "餐飲", "奇異果": "餐飲", "水果": "餐飲",
+    # 飲料
+    "飲料": "飲料", "奶茶": "飲料", "紅茶": "飲料", "綠茶": "飲料",
+    "咖啡": "飲料", "拿鐵": "飲料", "手搖": "飲料", "可樂": "飲料", "汽水": "飲料",
+}
+
+# 查詢語意別名（將「今日晚餐」解讀為：今天的餐飲）
+SEARCH_ALIAS_TO_CATEGORY = {
+    "早餐": "餐飲", "午餐": "餐飲", "晚餐": "餐飲", "宵夜": "餐飲"
+}
+
 # === 時區設定（可用環境變數 APP_TZ 覆蓋，預設 Asia/Taipei） ===
 APP_TZ = os.getenv('APP_TZ', 'Asia/Taipei')
 TIMEZONE = ZoneInfo(APP_TZ)
@@ -614,6 +637,13 @@ def handle_nlp_record(sheet, budget_sheet, text, user_id, user_name, event_time)
             # 嘗試合併像「晚餐180+60+135」這類被誤拆的多筆紀錄
             try:
                 records, _did = _try_collapse_add_expr_from_text(text, records)
+
+            # === 規則覆蓋：依備註套用自訂分類 ===
+            for rec in records:
+                notes = str(rec.get('notes', ''))
+                for kw, cat in CUSTOM_CATEGORY_RULES.items():
+                    if kw in notes:
+                        rec['category'] = cat
             except Exception as _e:
                 logger.warning(f"合併加法表達式失敗：{_e}")
             if not records:
@@ -1380,106 +1410,148 @@ def get_spending_data_for_month(sheet, user_id, year, month):
     return {"total": total_expense, "categories": category_spending}
 
 
-def handle_search_records(sheet, user_id, query_text, event_time):
+
+def handle_search_records(sheet, user_id, keyword, event_time):
     """
-    處理關鍵字和日期區間查詢 (使用 NLP)
+    查詢功能：
+    - 支援「今天 / 昨天 / 這週 / 上週 / 這個月」等時間詞（不依賴 NLP，內建解析）
+    - 同時支援一般關鍵字（比對 類別 / 備註）
+    - 特例：「今日/今天 + 早餐/午餐/晚餐/宵夜」→ 今天 + 餐飲
+    - 回傳摘要 + 小計
     """
-    logger.debug(f"處理 '查詢' 指令，user_id: {user_id}, query: {query_text}")
-
     try:
-        parsed_query = call_search_nlp(query_text, event_time)
-        if parsed_query.get('status') == 'failure':
-            return parsed_query.get('message', "🦝 查詢失敗，我不太懂您的意思。")
+        # 嘗試解析常見語意：例如「今日晚餐」→ 今天 + 餐飲
+        text = keyword.strip()
+        start_date = None
+        end_date = None
+        kw = None
+        label = f"「{text}」"
 
-        keyword = parsed_query.get('keyword')
-        start_date = parsed_query.get('start_date')
-        end_date = parsed_query.get('end_date')
-        nlp_message = parsed_query.get('message', f"關鍵字「{keyword or ''}」")
-            
-    except Exception as e:
-        logger.error(f"查詢的 NLP 解析失敗：{e}", exc_info=True)
-        return f"查詢失敗：AI 分析器出錯：{str(e)}"
-        
-    logger.debug(f"NLP 解析結果：Keyword: {keyword}, Start: {start_date}, End: {end_date}")
+        def set_today():
+            nonlocal start_date, end_date
+            d = event_time.strftime('%Y-%m-%d')
+            start_date = d
+            end_date = d
 
-    records = sheet.get_all_records()
-    matches = []
-    
-    try:
+        # 時間詞
+        if text in ("今天", "今日"):
+            set_today()
+        elif text == "昨天":
+            d = (event_time.date() - timedelta(days=1)).strftime('%Y-%m-%d')
+            start_date = end_date = d
+        elif text in ("這週", "本週"):
+            today = event_time.date()
+            s = today - timedelta(days=today.weekday())
+            e = s + timedelta(days=6)
+            start_date = s.strftime('%Y-%m-%d')
+            end_date = e.strftime('%Y-%m-%d')
+        elif text == "上週":
+            today = event_time.date()
+            s = today - timedelta(days=today.weekday() + 7)
+            e = s + timedelta(days=6)
+            start_date = s.strftime('%Y-%m-%d')
+            end_date = e.strftime('%Y-%m-%d')
+        elif text in ("這個月", "本月"):
+            s = event_time.replace(day=1).strftime('%Y-%m-%d')
+            next_month = (event_time.replace(day=28) + timedelta(days=4)).replace(day=1)
+            e = (next_month - timedelta(days=1)).strftime('%Y-%m-%d')
+            start_date, end_date = s, e
+        else:
+            # 特例："今日/今天 + (早餐/午餐/晚餐/宵夜)" -> 今天 + 餐飲
+            for m_alias, cat in SEARCH_ALIAS_TO_CATEGORY.items():
+                if text.endswith(m_alias) and (text.startswith("今天") or text.startswith("今日")):
+                    set_today()
+                    kw = cat
+                    break
+            # 一般關鍵字
+            if not kw:
+                kw = text
+
+        # 讀表
+        all_values = sheet.get_all_values()
+        if not all_values:
+            return "🦝 您的帳本是空的喔！"
+
+        header = all_values[0]
+        try:
+            idx_uid = header.index('使用者ID')
+            try:
+                idx_time = header.index('日期')
+            except ValueError:
+                idx_time = header.index('時間')
+            idx_cat = header.index('類別')
+            idx_note = header.index('備註')
+            idx_amount = header.index('金額')
+        except ValueError:
+            return "查詢失敗：找不到必要的 GSheet 欄位，請檢查標頭是否正確。"
+
+        results = []
+        expense_sum = 0.0
+        income_sum = 0.0
         start_dt = datetime.strptime(start_date, '%Y-%m-%d').date() if start_date else None
         end_dt = datetime.strptime(end_date, '%Y-%m-%d').date() if end_date else None
-    except ValueError as e:
-        return f"AI 回傳的日期格式錯誤 ({start_date}, {end_date})。"
 
-    for r in records:
-        if r.get('使用者ID') != user_id:
-            continue
-        
-        keyword_match = True
-        date_match = True
-        
-        if keyword:
-            keyword_match = (keyword in r.get('類別', '')) or (keyword in r.get('備註', ''))
-        
-        record_datetime_str = get_datetime_from_record(r)
-        
-        if (start_dt or end_dt) and record_datetime_str:
-            try:
-                record_dt = datetime.strptime(record_datetime_str[:10], '%Y-%m-%d').date()
-                    
-                if start_dt and record_dt < start_dt:
-                    date_match = False
-                if end_dt and record_dt > end_dt:
-                    date_match = False
-            except ValueError:
-                date_match = False 
-        
-        if keyword_match and date_match:
-            matches.append(r)
-    
-    if not matches:
-        return f"🦝 找不到關於「{nlp_message}」的任何記錄喔！"
-    
-    reply = f"🔎 {nlp_message} (共 {len(matches)} 筆)：\n\n"
-    limit = 20 
-    
-    sorted_matches = sorted(matches, key=lambda x: get_datetime_from_record(x), reverse=True)
-    
-    total_amount_all_matches = 0.0
-    
-    for r in sorted_matches:
-         try:
-            amount = float(r.get('金額', 0))
-            total_amount_all_matches += amount
-            
-            if len(reply.split('\n')) <= limit + 5: 
-                category = r.get('類別', 'N/A')
-                notes = r.get('備註', 'N/A')
-                date_str = get_datetime_from_record(r)
-                
-                if not date_str:
-                     display_date = "N/A"
+        for i in range(1, len(all_values)):
+            row = all_values[i]
+            if len(row) <= max(idx_uid, idx_time, idx_cat, idx_note, idx_amount):
+                continue
+            if row[idx_uid] != user_id:
+                continue
+
+            # 日期條件
+            date_ok = True
+            record_datetime_str = row[idx_time]
+            if (start_dt or end_dt) and record_datetime_str:
+                try:
+                    rd = datetime.strptime(record_datetime_str[:10], '%Y-%m-%d').date()
+                    if start_dt and rd < start_dt:
+                        date_ok = False
+                    if end_dt and rd > end_dt:
+                        date_ok = False
+                except ValueError:
+                    date_ok = False
+
+            # 關鍵字條件（比對 類別/備註，空則視為通過）
+            kw_ok = True
+            if kw:
+                kw_ok = (kw in row[idx_cat]) or (kw in row[idx_note])
+
+            if date_ok and kw_ok:
+                note = row[idx_note]
+                cat = row[idx_cat]
+                amt_str = row[idx_amount]
+                try:
+                    amt = float(amt_str)
+                except (ValueError, TypeError):
+                    amt = 0.0
+                if amt < 0:
+                    expense_sum += abs(amt)
                 else:
-                    try:
-                        if len(date_str) > 10:
-                            display_date = datetime.strptime(date_str, '%Y-%m-%d %H:%M:%S').strftime('%Y-%m-%d %H:%M')
-                        else:
-                            display_date = datetime.strptime(date_str, '%Y-%m-%d').strftime('%Y-%m-%d')
-                    except ValueError:
-                        display_date = date_str 
-                
-                reply += f"• {display_date} {notes} ({category}) {amount:.0f} 元\n"
-                
-         except (ValueError, TypeError):
-            continue
-    
-    reply += f"\n--------------------\n"
-    reply += f"📈 查詢總計：{total_amount_all_matches:.0f} 元\n"
-    
-    if len(matches) > limit:
-        reply += f"(僅顯示最近 {limit} 筆記錄)"
-        
-    return reply
+                    income_sum += amt
+                results.append((record_datetime_str[:16], note, cat, amt))
+
+        if not results:
+            return f"🦝 找不到關於{label}的任何記錄喔！"
+
+        results.sort(key=lambda x: x[0])
+        lines = []
+        for t, note, cat, amt in results[:10]:
+            lines.append(f"• {t} {note} ({cat}) {abs(amt):.0f} 元")
+        more = ""
+        if len(results) > 10:
+            more = f"\n…還有 {len(results)-10} 筆未顯示"
+
+        return (
+            f"📝 **查詢結果**（{label}）：\n"
+            + "\n".join(lines)
+            + more
+            + "\n\n"
+            + f"📊 小計：支出 {expense_sum:.0f} 元，收入 {income_sum:.0f} 元"
+        )
+
+    except Exception as e:
+        logger.error(f"handle_search_records failed: {e}", exc_info=True)
+        return f"查詢失敗：{str(e)}"
 
 def call_search_nlp(query_text, event_time):
     """
