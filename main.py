@@ -174,7 +174,7 @@ def get_user_intent(text, event_time):
     - UNKNOWN: 無法分類
 
     範例：
-    輸入: "刪掉早上的草莓麵包$55" -> {"intent": "DELETE"}
+    輸入: "刪掉早上的草莓麵包$$55" -> {"intent": "DELETE"}
     輸入: "查詢今天" -> {"intent": "QUERY_DATA"}
     輸入: "香蕉能改為餐飲嗎？" -> {"intent": "UPDATE"}
     輸入: "有什麼建議" -> {"intent": "QUERY_ADVICE"}
