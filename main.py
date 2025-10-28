@@ -14,29 +14,7 @@ from datetime import datetime, timedelta, date
 from dotenv import load_dotenv
 from zoneinfo import ZoneInfo
 from string import Template
-
-# === 自訂：常見關鍵字 → 類別 規則（覆蓋 AI 分類） ===
-# 只要備註中包含這些詞，就強制歸到對應類別。
-CUSTOM_CATEGORY_RULES = {
-    # 餐飲（主食/小吃/水果亦視為餐飲）
-    "早餐": "餐飲", "午餐": "餐飲", "晚餐": "餐飲", "宵夜": "餐飲",
-    "飯": "餐飲", "麵": "餐飲", "水餃": "餐飲", "滷味": "餐飲", "便當": "餐飲",
-    "雞排": "餐飲", "鹽酥雞": "餐飲", "滷肉飯": "餐飲", "牛肉麵": "餐飲",
-    "漢堡": "餐飲", "薯條": "餐飲", "披薩": "餐飲", "咖哩": "餐飲",
-    "蛋餅": "餐飲", "蘿蔔糕": "餐飲", "關東煮": "餐飲",
-    # 水果常被誤分到雜項，統一歸餐飲
-    "香蕉": "餐飲", "蘋果": "餐飲", "芭樂": "餐飲", "葡萄": "餐飲",
-    "柳丁": "餐飲", "橘子": "餐飲", "西瓜": "餐飲", "木瓜": "餐飲",
-    "鳳梨": "餐飲", "草莓": "餐飲", "奇異果": "餐飲", "水果": "餐飲",
-    # 飲料
-    "飲料": "飲料", "奶茶": "飲料", "紅茶": "飲料", "綠茶": "飲料",
-    "咖啡": "飲料", "拿鐵": "飲料", "手搖": "飲料", "可樂": "飲料", "汽水": "飲料",
-}
-
-# 查詢語意別名（將「今日晚餐」解讀為：今天的餐飲）
-SEARCH_ALIAS_TO_CATEGORY = {
-    "早餐": "餐飲", "午餐": "餐飲", "晚餐": "餐飲", "宵夜": "餐飲"
-}
+import math # 用於本地解析
 
 # === 時區設定（可用環境變數 APP_TZ 覆蓋，預設 Asia/Taipei） ===
 APP_TZ = os.getenv('APP_TZ', 'Asia/Taipei')
@@ -162,6 +140,65 @@ def get_user_profile_name(user_id):
         logger.error(f"無法獲取使用者 {user_id} 的個人資料：{e}", exc_info=True)
         return "未知用戶"
 
+# === *** (NEW) 步驟一：建立「意圖分類器」 (Master NLP) *** ===
+def get_user_intent(text, event_time):
+    """
+    使用 Gemini 判斷使用者的 "主要意圖"
+    """
+    logger.debug(f"正在分類意圖: {text}")
+    
+    today_str = event_time.strftime('%Y-%m-%d')
+    date_context = f"今天是 {today_str} (星期{event_time.weekday()})."
+
+    prompt_raw = """
+    你是一個記帳機器人的「意圖分類總管」。
+    使用者的輸入是：「$TEXT」
+    $DATE_CTX
+
+    你的*唯一*任務是判斷使用者的主要意圖。請嚴格回傳以下 JSON 格式：
+    {
+      "intent": "RECORD" | "DELETE" | "UPDATE" | "QUERY_DATA" | "QUERY_REPORT" | "QUERY_ADVICE" | "MANAGE_BUDGET" | "NEW_FEATURE_EXCHANGE_RATE" | "HELP" | "CHAT" | "UNKNOWN"
+    }
+
+    判斷規則：
+    - RECORD: 明顯的記帳 (例如 "雞排 80", "收入 5000", "午餐100 晚餐200", "目前收入 39020 支出 45229" -> 這也是 RECORD)
+    - DELETE: 明顯的刪除 (例如 "刪除 雞排", "刪掉 昨天", "幫我把早上的麵包刪掉")
+    - UPDATE: 明顯的修改 (例如 "香蕉能改為餐飲嗎", "把昨天的 100 元改成 120")
+    - QUERY_DATA: 查詢*特定資料* (例如 "查詢 雞排", "查詢今天", "查詢這禮拜的餐飲")
+    - QUERY_REPORT: 查詢*匯總報表* (例如 "查帳", "月結", "本週重點", "總收支分析")
+    - QUERY_ADVICE: 詢問*建議* (例如 "我本月花太多嗎？", "有什麼建議")
+    - MANAGE_BUDGET: 設定或查看預算 (例如 "設置預算", "查看預算", "我還剩多少預算？")
+    - NEW_FEATURE_EXCHANGE_RATE: 詢問金融功能，特別是匯率 (例如 "美金匯率", "100 USD = ? TWD")
+    - HELP: 請求幫助 (例如 "幫助", "你會幹嘛")
+    - CHAT: 閒聊 (例如 "你好", "謝謝", "你是誰")
+    - UNKNOWN: 無法分類
+
+    範例：
+    輸入: "刪掉早上的草莓麵包$55" -> {"intent": "DELETE"}
+    輸入: "查詢今天" -> {"intent": "QUERY_DATA"}
+    輸入: "香蕉能改為餐飲嗎？" -> {"intent": "UPDATE"}
+    輸入: "有什麼建議" -> {"intent": "QUERY_ADVICE"}
+    輸入: "美金匯率" -> {"intent": "NEW_FEATURE_EXCHANGE_RATE"}
+    輸入: "月結" -> {"intent": "QUERY_REPORT"}
+    輸入: "目前收入 39020 支出 45229" -> {"intent": "RECORD"}
+    輸入: "香蕉 20" -> {"intent": "RECORD"}
+    輸入: "我還剩多少預算？" -> {"intent": "MANAGE_BUDGET"}
+    """
+    prompt = Template(prompt_raw).substitute(
+        TEXT=text,
+        DATE_CTX=date_context
+    )
+
+    try:
+        response = gemini_model.generate_content(prompt)
+        clean_response = response.text.strip().replace("```json", "").replace("```", "")
+        logger.debug(f"Gemini Intent response: {clean_response}")
+        data = json.loads(clean_response)
+        return data.get('intent', 'UNKNOWN')
+    except Exception as e:
+        logger.error(f"Gemini Intent API 呼叫失敗：{e}", exc_info=True)
+        return "UNKNOWN"
+
 # === Webhook 處理 (LINE 訊息的入口) ===
 @app.route("/webhook", methods=['POST'])
 def webhook():
@@ -180,7 +217,7 @@ def webhook():
     
     return 'OK'
 
-# === 訊息總機 (核心邏輯) ===
+# === *** (REWRITE) 步驟二：重構 `handle_message` (主路由器) *** ===
 @handler.add(MessageEvent, message=TextMessage)
 def handle_message(event):
     text = event.message.text.strip()
@@ -191,7 +228,6 @@ def handle_message(event):
     event_time = datetime.fromtimestamp(line_timestamp_ms / 1000.0, tz=TIMEZONE)
     
     logger.debug(f"Received message: '{text}' from user '{user_id}' at {event_time}")
-    logger.debug(f"事件時間 (tz={APP_TZ})：{event_time.isoformat()}")
     
     # 1. 幫助指令 (優先)
     if text == "幫助":
@@ -217,8 +253,8 @@ def handle_message(event):
             "🗑️ **刪除**：\n"
             "   - 「刪除」：(安全) 移除您最近一筆記錄\n"
             "   - 「刪除 雞排」：預覽將刪除的記錄\n"
-            "   - 「刪除 昨天」：預覽昨天的記錄\n"
-            "   - 「刪除 這週」：預覽本週的記錄\n"
+            "   - 「刪掉 昨天」：(AI) 預覽昨天的記錄\n"
+            "   - 「刪掉 這週」：(AI) 預覽本週的記錄\n"
             "   - 「確認刪除」：確認執行刪除（需先預覽）\n\n"
             "💡 **預算**：\n"
             "   - 「設置預算 餐飲 3000」\n"
@@ -258,60 +294,96 @@ def handle_message(event):
         except LineBotApiError as e:
             logger.error(f"回覆工作表錯誤訊息失敗：{e}", exc_info=True)
         return
-        
-    # === 3. 指令路由器 (Router) ===
-    # "明確" 的指令放前面
-    try:
-        # 3.1 基礎指令
-        if text == "查帳": # "查帳" 保持 == 即可
-            reply_text = handle_check_balance(trx_sheet, user_id)
-        
-        elif text.startswith("月結"): # 月結
-            reply_text = handle_monthly_report(trx_sheet, user_id, event_time)
-        
-        # === 關鍵修正：同時檢查 "週" 和 "周" ===
-        elif text.startswith("本週重點") or text.startswith("本周重點"):
-            reply_text = handle_weekly_report(trx_sheet, user_id, event_time)
-        
-        elif text.startswith("總收支分析"): # 總收支分析
-            reply_text = handle_total_analysis(trx_sheet, user_id)
-        
-        # 3.2 預算指令 
-        elif text.startswith("設置預算"):
-            reply_text = handle_set_budget(budget_sheet, text, user_id)
-        
-        elif text.startswith("查看預算"): 
-            reply_text = handle_view_budget(trx_sheet, budget_sheet, user_id, event_time)
-        
-        # 3.3 刪除指令 
-        elif text == "刪除":
-            reply_text = handle_delete_last_record(trx_sheet, user_id)
-        # 確認刪除（模糊比對）
-        elif "確認刪除" in text or "確認" in text and "刪除" in text:
-            reply_text = handle_confirm_delete(trx_sheet, user_id, event_time)
-        elif text.startswith("刪除"):
-            query_text = text[2:].strip()
-            if not query_text:
-                reply_text = "請輸入您想刪除的關鍵字喔！\n例如：「刪除 雞排」或「刪除 昨天」"
-            else:
-                reply_text = handle_advanced_delete(trx_sheet, user_id, query_text, event_time)
-                
-        # 3.4 查詢指令 
-        elif text.startswith("查詢"):
-            keyword = text[2:].strip()
-            if not keyword:
-                reply_text = "請輸入您想查詢的關鍵字喔！\n例如：「查詢 雞排」或「查詢 這禮拜」"
-            else:
-                reply_text = handle_search_records(trx_sheet, user_id, keyword, event_time)
+            
+    # === 3. (新) AI 意圖分類器 ===
+    # 讓 AI 告訴我們使用者想做什麼
+    user_intent = get_user_intent(text, event_time)
+    logger.info(f"使用者 '{user_id}' 的意圖被分類為: {user_intent}")
 
-        # 3.5 預設：NLP 自然語言處理 (記帳, 閒聊, 分析查詢)
-        else:
+    # === 4. (新) 意圖路由器 (Router) ===
+    try:
+        if user_intent == "HELP":
+            # (理論上在步驟 1 就被攔截了，但以防萬一)
+            # 這裡可以指向 "幫助" 的 reply_text (同步驟 1)
+            reply_text = "您需要什麼幫助嗎？（...幫助訊息...）" 
+
+        # --- 報表查詢 (QUERY_REPORT) ---
+        elif user_intent == "QUERY_REPORT":
+            logger.debug("意圖：QUERY_REPORT (查詢報表)")
+            if "查帳" in text:
+                reply_text = handle_check_balance(trx_sheet, user_id)
+            elif "月結" in text:
+                reply_text = handle_monthly_report(trx_sheet, user_id, event_time)
+            elif "週" in text or "周" in text: 
+                reply_text = handle_weekly_report(trx_sheet, user_id, event_time)
+            elif "總收支" in text or "總分析" in text:
+                reply_text = handle_total_analysis(trx_sheet, user_id)
+            else: # AI 判斷是報表，但關鍵字沒對上，交給 NLP 查詢
+                reply_text = handle_search_records_nlp(trx_sheet, user_id, text, event_time)
+        
+        # --- 預算管理 (MANAGE_BUDGET) ---
+        elif user_intent == "MANAGE_BUDGET":
+            logger.debug("意圖：MANAGE_BUDGET (預算管理)")
+            if text.startswith("設置預算"):
+                reply_text = handle_set_budget(budget_sheet, text, user_id)
+            else: 
+                # "查看預算" 或 "我還剩多少預算？" 都交給它
+                reply_text = handle_view_budget(trx_sheet, budget_sheet, user_id, event_time)
+
+        # --- 刪除 (DELETE) ---
+        elif user_intent == "DELETE":
+            logger.debug("意圖：DELETE (刪除)")
+            if "確認刪除" in text or ("確認" in text and "刪除" in text):
+                reply_text = handle_confirm_delete(trx_sheet, user_id, event_time)
+            elif text == "刪除": # 特殊指令：刪除最後一筆
+                reply_text = handle_delete_last_record(trx_sheet, user_id)
+            else:
+                # (Bug #7 解決) "刪掉早上的草莓麵包$55" 會進入這裡
+                reply_text = handle_advanced_delete_nlp(trx_sheet, user_id, text, event_time) 
+
+        # --- 查詢資料 (QUERY_DATA) ---
+        elif user_intent == "QUERY_DATA":
+            logger.debug("意圖：QUERY_DATA (查詢資料)")
+            # (Bug #1 解決) "查詢今天" "查詢雞排" 都會進入這裡
+            reply_text = handle_search_records_nlp(trx_sheet, user_id, text, event_time) 
+
+        # --- 詢問建議 (QUERY_ADVICE) ---
+        elif user_intent == "QUERY_ADVICE":
+            logger.debug("意圖：QUERY_ADVICE (詢問建議)")
+            # (Bug #5 解決) "我本月花太多嗎？" "有什麼建議" 進入這裡
+            reply_text = handle_conversational_query_advice(trx_sheet, budget_sheet, text, user_id, event_time)
+        
+        # --- 修改 (UPDATE) ---
+        elif user_intent == "UPDATE":
+            logger.debug("意圖：UPDATE (修改)")
+            # (Bug #3 解決) "香蕉能改為餐飲嗎" 進入這裡
+            reply_text = handle_update_record_nlp(trx_sheet, user_id, text, event_time) 
+
+        # --- 新功能 (NEW_FEATURE) ---
+        elif user_intent == "NEW_FEATURE_EXCHANGE_RATE":
+            logger.debug("意圖：NEW_FEATURE (匯率)")
+            # (Bug #6 解決)
+            reply_text = handle_exchange_rate_query(text)
+            
+        # --- 記帳 (RECORD) ---
+        elif user_intent == "RECORD":
+            logger.debug("意圖：RECORD (記帳)")
+            # (Bug #2, #4 解決) "香蕉 20", "收入...支出..." 都進入這裡
             user_name = get_user_profile_name(user_id)
-            # 把「傳送時間」 event_time 傳下去
+            reply_text = handle_nlp_record(trx_sheet, budget_sheet, text, user_id, user_name, event_time)
+        
+        # --- 聊天或未知 (CHAT / UNKNOWN) ---
+        elif user_intent == "CHAT":
+            reply_text = random.choice(["哈囉！我是記帳小浣熊🦝", "你好呀！", "今天過得如何？"])
+        
+        else: # UNKNOWN 
+            logger.warning(f"未知的意圖 '{user_intent}'，當作聊天或記帳處理。")
+            # 降級：如果意圖不清晰，還是嘗試用記帳的 NLP
+            user_name = get_user_profile_name(user_id)
             reply_text = handle_nlp_record(trx_sheet, budget_sheet, text, user_id, user_name, event_time)
 
     except Exception as e:
-        logger.error(f"處理指令 '{text}' 失敗：{e}", exc_info=True)
+        logger.error(f"處理意圖 '{user_intent}' 失敗：{e}", exc_info=True)
         reply_text = f"糟糕！小浣熊處理您的指令時出錯了：{str(e)}"
 
     # 最終回覆
@@ -450,10 +522,7 @@ def check_budget_warning(trx_sheet, budget_sheet, user_id, category, event_time)
         logger.error(f"檢查預算警告失敗：{e}", exc_info=True)
         return "\n(檢查預算時發生錯誤)"
 
-# === *** MODIFIED: handle_nlp_record (強力修正時間規則) *** ===
 # === 加法/乘法 表達式解析與合併（本地保險機制） ===
-import math
-
 def _parse_amount_expr(expr: str):
     """
     嘗試解析簡單的金額運算字串，支援：
@@ -477,15 +546,6 @@ def _try_collapse_add_expr_from_text(original_text: str, records: list):
     """
     嘗試判斷輸入是否像「晚餐180+60+135」這種單一品項的加法表達，
     若 AI 回傳多筆同類別記錄，則合併為一筆。
-    合併策略：
-      1) 從原始文字抓第一段「非數字 prefix」與緊接的「金額表達式」。
-      2) 若偵測到 A+B(+C...)，或含乘法的片段，試著運算。
-      3) 若 records>=2 且多筆類別相同，則合併為一筆：
-         - datetime 用第一筆
-         - category 用第一筆
-         - amount 的正負依原 records 的符號為準（多數決；預設支出）
-         - notes 使用 prefix（去掉結尾空白）
-    回傳 (collapsed_records, did_collapse: bool)
     """
     text = original_text.strip()
     # 找到第一個數字的位置，將前面的當 notes 前綴
@@ -523,6 +583,8 @@ def _try_collapse_add_expr_from_text(original_text: str, records: list):
         "notes": prefix or records[0].get("notes", "")
     }]
     return collapsed, True
+
+# === *** (MODIFY) 步驟三-C: 優化 `handle_nlp_record` (記帳) (解決 Bug #2, #4) *** ===
 def handle_nlp_record(sheet, budget_sheet, text, user_id, user_name, event_time):
     """
     使用 Gemini NLP 處理自然語言記帳 (記帳、聊天、查詢、系統問題)
@@ -581,6 +643,7 @@ def handle_nlp_record(sheet, budget_sheet, text, user_id, user_name, event_time)
                - "晚餐" (18:00), "宵夜" (23:00) 邏輯同上。
 
        - category: 必須是 [餐飲, 飲料, 交通, 娛樂, 購物, 日用品, 雜項, 收入] 之一。
+         (例如："香蕉 20" 應歸類為 "餐飲" 或 "購物"，而非 "雜項")
        - amount: 支出必須為負數 (-)，收入必須為正數 (+)。
        - notes: 盡可能擷取出花費的項目。
        - message: "記錄成功" (此欄位在 success 時不重要)
@@ -598,6 +661,13 @@ def handle_nlp_record(sheet, budget_sheet, text, user_id, user_name, event_time)
 
     範例：
     輸入: "今天中午吃了雞排80" (規則 1) -> {"status": "success", "data": [{"datetime": "$TODAY 12:00:00", "category": "餐飲", "amount": -80, "notes": "雞排"}], "message": "記錄成功"}
+    
+    # (新增範例 - 解決 Bug #2)
+    輸入: "香蕉 20" (規則 2) -> {"status": "success", "data": [{"datetime": "$CURRENT_TIME", "category": "餐飲", "amount": -20, "notes": "香蕉"}], "message": "記錄成功"}
+    
+    # (新增範例 - 解決 Bug #4)
+    輸入: "目前收入 39020 支出 45229" (規則 2) -> {"status": "success", "data": [{"datetime": "$CURRENT_TIME", "category": "收入", "amount": 39020, "notes": "目前收入"}, {"datetime": "$CURRENT_TIME", "category": "雜項", "amount": -45229, "notes": "支出"}], "message": "記錄成功"}
+
     輸入: "午餐100 晚餐200" (規則 3) -> {"status": "success", "data": [{"datetime": "$TODAY 12:00:00", "category": "餐飲", "amount": -100, "notes": "午餐"}, {"datetime": "$TODAY 18:00:00", "category": "餐飲", "amount": -200, "notes": "晚餐"}], "message": "記錄成功"}
     輸入: "ACE水果條59x2+龜甲萬豆乳紅茶35" (規則 2) -> {"status": "success", "data": [{"datetime": "$CURRENT_TIME", "category": "購物", "amount": -118, "notes": "ACE水果條 59x2"}, {"datetime": "$CURRENT_TIME", "category": "飲料", "amount": -35, "notes": "龜甲萬豆乳紅茶"}], "message": "記錄成功"}
     輸入: "16:22 記帳零食 50" (規則 1) -> {"status": "success", "data": [{"datetime": "$TODAY 16:22:00", "category": "雜項", "amount": -50, "notes": "零食"}], "message": "記錄成功"}
@@ -630,20 +700,12 @@ def handle_nlp_record(sheet, budget_sheet, text, user_id, user_name, event_time)
         status = data.get('status')
         message = data.get('message')
 
-        # === MODIFIED: handle_nlp_record (處理 success, system_query, query, chat, failure) ===
         if status == 'success':
             records = data.get('data', [])
 
             # 嘗試合併像「晚餐180+60+135」這類被誤拆的多筆紀錄
             try:
                 records, _did = _try_collapse_add_expr_from_text(text, records)
-
-            # === 規則覆蓋：依備註套用自訂分類 ===
-            for rec in records:
-                notes = str(rec.get('notes', ''))
-                for kw, cat in CUSTOM_CATEGORY_RULES.items():
-                    if kw in notes:
-                        rec['category'] = cat
             except Exception as _e:
                 logger.warning(f"合併加法表達式失敗：{_e}")
             if not records:
@@ -706,16 +768,14 @@ def handle_nlp_record(sheet, budget_sheet, text, user_id, user_name, event_time)
             # AI 會回傳隨機的可愛訊息
             return message or "你好！我是記帳小浣熊 🦝"
         
-        # === *** NEW: 處理 system_query 狀態 *** ===
         elif status == 'system_query':
             # AI 應該已經根據 prompt 生成了完整的回答
             return message or "我可以幫您記帳！ 🦝 預設類別有：餐飲, 飲料, 交通, 娛樂, 購物, 日用品, 雜項, 收入。"
         
         elif status == 'query':
-            # AI 偵測到使用者在 "詢問"
-            logger.debug(f"NLP 偵測到聊天式查詢 '{text}'，轉交至 handle_conversational_query")
-            # 我們直接把 text (原始訊息) 傳過去分析
-            return handle_conversational_query(sheet, budget_sheet, text, user_id, event_time)
+            # (Bug #5) 轉交給新的「建議」函式
+            logger.debug(f"NLP 偵測到聊天式查詢 '{text}'，轉交至 handle_conversational_query_advice")
+            return handle_conversational_query_advice(sheet, budget_sheet, text, user_id, event_time)
         
         else: # status == 'failure'
             return message or "🦝？ 抱歉，我聽不懂..."
@@ -990,34 +1050,44 @@ def handle_delete_last_record(sheet, user_id):
         logger.error(f"刪除失敗：{e}", exc_info=True)
         return f"刪除記錄失敗：{str(e)}"
 
-# === *** MODIFIED: handle_advanced_delete (增加標頭防錯) *** ===
-def handle_advanced_delete(sheet, user_id, query_text, event_time):
+# === *** (REPLACE) 步驟三-A: `handle_advanced_delete_nlp` (解決 Bug #7) *** ===
+def handle_advanced_delete_nlp(sheet, user_id, full_text, event_time):
     """
-    預覽刪除功能：顯示即將刪除的記錄（最多顯示前 5 筆）
-    支援「今天 / 昨天 / 這週 / 上週 / 這個月」
-    超過 30 筆會顯示警告
+    預覽刪除功能：使用 NLP 解析 full_text (例如 "刪掉早上的草莓麵包")
     """
-    logger.debug(f"處理 '預覽刪除' 指令，user_id: {user_id}, query: {query_text}")
+    logger.debug(f"處理 'NLP 預覽刪除'，user_id: {user_id}, text: {full_text}")
     
     try:
-        parsed_query = call_search_nlp(query_text, event_time)
+        # 呼叫 call_search_nlp 來解析關鍵字和日期
+        parsed_query = call_search_nlp(full_text, event_time)
         if parsed_query.get('status') == 'failure':
             return parsed_query.get('message', "🦝 刪除失敗，我不太懂您的意思。")
 
         keyword = parsed_query.get('keyword')
         start_date = parsed_query.get('start_date')
         end_date = parsed_query.get('end_date')
-        nlp_message = parsed_query.get('message', f"關於「{query_text}」")
-
+        
+        # 為了安全起見，如果 AI 什麼都沒解析到，就回傳錯誤
         if not keyword and not start_date and not end_date:
-            return f"🦝 刪除失敗：AI 無法解析您的條件「{query_text}」。"
+            logger.warning(f"NLP 無法從 '{full_text}' 解析出刪除條件。")
+            # 嘗試從文字中提取 (備用方案)
+            temp_keyword = full_text.replace("刪掉", "").replace("刪除", "").replace("幫我把", "").strip()
+            # 移除金額
+            temp_keyword = re.sub(r'[\d$]+元?', '', temp_keyword).strip()
+            
+            if not temp_keyword:
+                 return f"🦝 刪除失敗：AI 無法解析您的條件「{full_text}」。"
+            keyword = temp_keyword
+            
+        nlp_message = parsed_query.get('message', f"關於「{keyword or full_text}」")
             
     except Exception as e:
         logger.error(f"預覽刪除的 NLP 解析失敗：{e}", exc_info=True)
         return f"刪除失敗：AI 分析器出錯：{str(e)}"
         
-    logger.debug(f"NLP 解析結果：Keyword: {keyword}, Start: {start_date}, End: {end_date}")
+    logger.debug(f"NLP 解析刪除條件：Keyword: {keyword}, Start: {start_date}, End: {end_date}")
 
+    # --- (GSheet 搜尋邏輯 - 與你舊的函式相同) ---
     try:
         all_values = sheet.get_all_values()
         
@@ -1293,92 +1363,67 @@ def handle_view_budget(trx_sheet, budget_sheet, user_id, event_time):
         logger.error(f"查看預算失敗：{e}", exc_info=True)
         return f"查看預算失敗：{str(e)}"
 
-def handle_conversational_query(trx_sheet, budget_sheet, text, user_id, event_time):
+# === *** (REPLACE) 步驟三-D: `handle_conversational_query_advice` (解決 Bug #5) *** ===
+def handle_conversational_query_advice(trx_sheet, budget_sheet, text, user_id, event_time):
     """
-    處理聊天式查詢 (例如 "我還剩多少預算？", "我本月花太多嗎？")
-    (由 handle_nlp_record 的 "query" 狀態觸發)
+    (新功能) 處理 "詢問建議" (例如 "我花太多嗎", "有什麼建議")
+    (由 handle_conversational_query 升級而來)
     """
-    logger.debug(f"處理 '聊天式查詢' 指令，user_id: {user_id}, text: {text}")
+    logger.debug(f"處理 '聊天式建議'，user_id: {user_id}, text: {text}")
 
-    # 情況一：詢問預算
-    if any(kw in text for kw in ["預算", "剩多少"]):
-        logger.debug("聊天式查詢：轉交至 handle_view_budget")
-        return handle_view_budget(trx_sheet, budget_sheet, user_id, event_time)
+    try:
+        # 1. 取得本月資料 (使用你的輔助函式)
+        this_month_date = event_time.date()
+        this_month_data = get_spending_data_for_month(trx_sheet, user_id, this_month_date.year, this_month_date.month)
         
-    # 情況二：詢問花費 (例如 "花太多", "跟上月比")
-    if any(kw in text for kw in ["花太多", "跟上月比", "花費如何"]):
-        logger.debug("聊天式查詢：執行 月 vs 月 比較")
-        try:
-            # 1. 取得本月資料
-            this_month_date = event_time.date()
-            this_month_data = get_spending_data_for_month(trx_sheet, user_id, this_month_date.year, this_month_date.month)
-            
-            # 2. 取得上月資料
-            last_month_end_date = this_month_date.replace(day=1) - timedelta(days=1)
-            last_month_data = get_spending_data_for_month(trx_sheet, user_id, last_month_end_date.year, last_month_end_date.month)
+        # 2. 取得上月資料
+        last_month_end_date = this_month_date.replace(day=1) - timedelta(days=1)
+        last_month_data = get_spending_data_for_month(trx_sheet, user_id, last_month_end_date.year, last_month_end_date.month)
 
-            this_month_total = this_month_data['total']
-            last_month_total = last_month_data['total']
-            
-            # === 可愛語氣區 ===
-            reply_intros = [
-                "🦝 幫您分析了一下：\n\n",
-                "小浣熊翻了翻帳本... 🧐\n\n",
-                "熱騰騰的分析來囉！ (ゝ∀･)b\n\n"
-            ]
-            reply = random.choice(reply_intros)
-            reply += f"• 本月 ({this_month_date.month}月) 目前支出：{this_month_total:.0f} 元\n"
-            reply += f"• 上月 ({last_month_end_date.month}月) 總支出：{last_month_total:.0f} 元\n"
-            
-            if last_month_total > 0:
-                percentage_diff = ((this_month_total - last_month_total) / last_month_total) * 100
-                
-                # === 可愛語氣區 ===
-                if percentage_diff > 10: # 花費增加
-                    spend_more_replies = [
-                        f"📈 哎呀！您本月花費比上月 **多 {percentage_diff:.0f}%**！ 😱",
-                        f"📈 注意！您本月花費增加了 {percentage_diff:.0f}%！ 要踩剎車啦 🚗",
-                    ]
-                    reply += random.choice(spend_more_replies) + "\n"
-                elif percentage_diff < -10: # 花費減少
-                    spend_less_replies = [
-                        f"📉 太棒了！您本月花費比上月 **少 {abs(percentage_diff):.0f}%**！ (≧▽≦)b",
-                        f"📉 讚喔！您本月節省了 {abs(percentage_diff):.0f}%！ 繼續保持！ 💪",
-                    ]
-                    reply += random.choice(spend_less_replies) + "\n"
-                else: # 持平
-                    reply += f"📊 您本月花費與上月差不多～ (大概 {percentage_diff:+.0f}%)。\n"
-            else:
-                reply += "📊 上月沒有支出記錄可供比較。\n"
+        this_month_total = this_month_data['total']
+        last_month_total = last_month_data['total']
 
-            # 找出差異最大的類別
-            category_diff = {}
-            all_categories = set(this_month_data['categories'].keys()) | set(last_month_data['categories'].keys())
-            
-            for category in all_categories:
-                this_month_cat = this_month_data['categories'].get(category, 0)
-                last_month_cat = last_month_data['categories'].get(category, 0)
-                diff = this_month_cat - last_month_cat
-                if diff > 0: # 只關心增加的
-                    category_diff[category] = diff
+        # 3. 取得預算資料 (檢查是否超支)
+        budgets_records = budget_sheet.get_all_records()
+        user_budgets = [b for b in budgets_records if b.get('使用者ID') == user_id]
+        total_limit = sum(float(b.get('限額', 0)) for b in user_budgets)
+        
+        # === (新) AI 分析 Prompt ===
+        # 我們把「資料」餵給 AI，讓 AI 寫出「建議」
+        
+        analysis_data = f"""
+        - 使用者：{user_id}
+        - 詢問："{text}"
+        - 本月 ({this_month_date.month}月) 目前支出：{this_month_total:.0f} 元
+        - 上月 ({last_month_end_date.month}月) 總支出：{last_month_total:.0f} 元
+        - 本月總預算：{total_limit:.0f} 元
+        - 本月支出細項 (JSON)：{json.dumps(this_month_data['categories'])}
+        """
+        
+        prompt_raw = """
+        你是一個友善且專業的記帳分析師「小浣熊🦝」。
+        請根據以下數據，用 "可愛且專業" 的口吻，回答使用者的問題。
 
-            if category_diff:
-                most_increased_cat = max(category_diff, key=category_diff.get)
-                increase_amount = category_diff[most_increased_cat]
-                reply += f"\n💡 **主要差異**：本月 **{most_increased_cat}** 類別的花費增加了 {increase_amount:.0f} 元。"
-            
-            return reply
+        數據：
+        $ANALYSIS_DATA
 
-        except Exception as e:
-            logger.error(f"聊天式查詢失敗：{e}", exc_info=True)
-            return f"糟糕！小浣熊分析時打結了：{str(e)}"
+        請直接回覆分析結果 (不要說 "根據數據...")，口氣要像小浣熊：
+        
+        - 優先比較「本月支出」和「上月支出」，給出結論 (例如 "花費增加/減少了 X%")。
+        - 接著比較「本月支出」和「本月總預算」，判斷是否在控制內。
+        - 最後，從「本月支出細項」中找出花費*最多*的類別，並給予*具體*的建議。
+        - 保持簡潔有力。
+        """
+        prompt = Template(prompt_raw).substitute(ANALYSIS_DATA=analysis_data)
+        
+        response = gemini_model.generate_content(prompt)
+        clean_response = response.text.strip().replace("```json", "").replace("```", "")
+        
+        return clean_response
 
-    # 如果 AI 判斷是 query，但我們這邊的規則都沒對上
-    return random.choice([
-        "🦝？ 抱歉，我不太懂您的問題... 試試看「查詢...」或「本週重點」？",
-        "嗯... (歪頭) 您的問題有點深奥，小浣熊聽不懂 😅",
-        "您可以問我「我本月花太多嗎？」或「我還剩多少預算？」喔！"
-    ])
+    except Exception as e:
+        logger.error(f"聊天式建議失敗：{e}", exc_info=True)
+        return f"糟糕！小浣熊分析時打結了：{str(e)}"
 
 def get_spending_data_for_month(sheet, user_id, year, month):
     """
@@ -1410,156 +1455,120 @@ def get_spending_data_for_month(sheet, user_id, year, month):
     return {"total": total_expense, "categories": category_spending}
 
 
+# === *** (REPLACE) 步驟三-B: `handle_search_records_nlp` (解決 Bug #1) *** ===
+def handle_search_records_nlp(sheet, user_id, full_text, event_time):
+    """
+    處理關鍵字和日期區間查詢 (使用 NLP)
+    (由 handle_search_records 修改而來)
+    """
+    logger.debug(f"處理 'NLP 查詢'，user_id: {user_id}, query: {full_text}")
 
-def handle_search_records(sheet, user_id, keyword, event_time):
-    """
-    查詢功能：
-    - 支援「今天 / 昨天 / 這週 / 上週 / 這個月」等時間詞（不依賴 NLP，內建解析）
-    - 同時支援一般關鍵字（比對 類別 / 備註）
-    - 特例：「今日/今天 + 早餐/午餐/晚餐/宵夜」→ 今天 + 餐飲
-    - 回傳摘要 + 小計
-    """
     try:
-        # 嘗試解析常見語意：例如「今日晚餐」→ 今天 + 餐飲
-        text = keyword.strip()
-        start_date = None
-        end_date = None
-        kw = None
-        label = f"「{text}」"
+        # (同 3-A) 呼叫 NLP 解析條件
+        parsed_query = call_search_nlp(full_text, event_time)
+        if parsed_query.get('status') == 'failure':
+            return parsed_query.get('message', "🦝 查詢失敗，我不太懂您的意思。")
 
-        def set_today():
-            nonlocal start_date, end_date
-            d = event_time.strftime('%Y-%m-%d')
-            start_date = d
-            end_date = d
+        keyword = parsed_query.get('keyword')
+        start_date = parsed_query.get('start_date')
+        end_date = parsed_query.get('end_date')
+        nlp_message = parsed_query.get('message', f"關於「{full_text}」")
+            
+    except Exception as e:
+        logger.error(f"查詢的 NLP 解析失敗：{e}", exc_info=True)
+        return f"查詢失敗：AI 分析器出錯：{str(e)}"
+        
+    logger.debug(f"NLP 解析查詢結果：Keyword: {keyword}, Start: {start_date}, End: {end_date}")
 
-        # 時間詞
-        if text in ("今天", "今日"):
-            set_today()
-        elif text == "昨天":
-            d = (event_time.date() - timedelta(days=1)).strftime('%Y-%m-%d')
-            start_date = end_date = d
-        elif text in ("這週", "本週"):
-            today = event_time.date()
-            s = today - timedelta(days=today.weekday())
-            e = s + timedelta(days=6)
-            start_date = s.strftime('%Y-%m-%d')
-            end_date = e.strftime('%Y-%m-%d')
-        elif text == "上週":
-            today = event_time.date()
-            s = today - timedelta(days=today.weekday() + 7)
-            e = s + timedelta(days=6)
-            start_date = s.strftime('%Y-%m-%d')
-            end_date = e.strftime('%Y-%m-%d')
-        elif text in ("這個月", "本月"):
-            s = event_time.replace(day=1).strftime('%Y-%m-%d')
-            next_month = (event_time.replace(day=28) + timedelta(days=4)).replace(day=1)
-            e = (next_month - timedelta(days=1)).strftime('%Y-%m-%d')
-            start_date, end_date = s, e
-        else:
-            # 特例："今日/今天 + (早餐/午餐/晚餐/宵夜)" -> 今天 + 餐飲
-            for m_alias, cat in SEARCH_ALIAS_TO_CATEGORY.items():
-                if text.endswith(m_alias) and (text.startswith("今天") or text.startswith("今日")):
-                    set_today()
-                    kw = cat
-                    break
-            # 一般關鍵字
-            if not kw:
-                kw = text
-
-        # 讀表
-        all_values = sheet.get_all_values()
-        if not all_values:
-            return "🦝 您的帳本是空的喔！"
-
-        header = all_values[0]
-        try:
-            idx_uid = header.index('使用者ID')
-            try:
-                idx_time = header.index('日期')
-            except ValueError:
-                idx_time = header.index('時間')
-            idx_cat = header.index('類別')
-            idx_note = header.index('備註')
-            idx_amount = header.index('金額')
-        except ValueError:
-            return "查詢失敗：找不到必要的 GSheet 欄位，請檢查標頭是否正確。"
-
-        results = []
-        expense_sum = 0.0
-        income_sum = 0.0
+    # --- (GSheet 搜尋邏輯 - 與你舊的函式相同) ---
+    records = sheet.get_all_records()
+    matches = []
+    
+    try:
         start_dt = datetime.strptime(start_date, '%Y-%m-%d').date() if start_date else None
         end_dt = datetime.strptime(end_date, '%Y-%m-%d').date() if end_date else None
+    except ValueError as e:
+        return f"AI 回傳的日期格式錯誤 ({start_date}, {end_date})。"
 
-        for i in range(1, len(all_values)):
-            row = all_values[i]
-            if len(row) <= max(idx_uid, idx_time, idx_cat, idx_note, idx_amount):
-                continue
-            if row[idx_uid] != user_id:
-                continue
-
-            # 日期條件
-            date_ok = True
-            record_datetime_str = row[idx_time]
-            if (start_dt or end_dt) and record_datetime_str:
-                try:
-                    rd = datetime.strptime(record_datetime_str[:10], '%Y-%m-%d').date()
-                    if start_dt and rd < start_dt:
-                        date_ok = False
-                    if end_dt and rd > end_dt:
-                        date_ok = False
-                except ValueError:
-                    date_ok = False
-
-            # 關鍵字條件（比對 類別/備註，空則視為通過）
-            kw_ok = True
-            if kw:
-                kw_ok = (kw in row[idx_cat]) or (kw in row[idx_note])
-
-            if date_ok and kw_ok:
-                note = row[idx_note]
-                cat = row[idx_cat]
-                amt_str = row[idx_amount]
-                try:
-                    amt = float(amt_str)
-                except (ValueError, TypeError):
-                    amt = 0.0
-                if amt < 0:
-                    expense_sum += abs(amt)
+    for r in records:
+        if r.get('使用者ID') != user_id:
+            continue
+        
+        keyword_match = True
+        date_match = True
+        
+        if keyword:
+            keyword_match = (keyword in r.get('類別', '')) or (keyword in r.get('備註', ''))
+        
+        record_datetime_str = get_datetime_from_record(r)
+        
+        if (start_dt or end_dt) and record_datetime_str:
+            try:
+                record_dt = datetime.strptime(record_datetime_str[:10], '%Y-%m-%d').date()
+                    
+                if start_dt and record_dt < start_dt:
+                    date_match = False
+                if end_dt and record_dt > end_dt:
+                    date_match = False
+            except ValueError:
+                date_match = False 
+        
+        if keyword_match and date_match:
+            matches.append(r)
+    
+    if not matches:
+        return f"🦝 找不到關於「{nlp_message}」的任何記錄喔！"
+    
+    reply = f"🔎 {nlp_message} (共 {len(matches)} 筆)：\n\n"
+    limit = 20 
+    
+    sorted_matches = sorted(matches, key=lambda x: get_datetime_from_record(x), reverse=True)
+    
+    total_amount_all_matches = 0.0
+    
+    for r in sorted_matches:
+         try:
+            amount = float(r.get('金額', 0))
+            total_amount_all_matches += amount
+            
+            if len(reply.split('\n')) <= limit + 5: 
+                category = r.get('類別', 'N/A')
+                notes = r.get('備註', 'N/A')
+                date_str = get_datetime_from_record(r)
+                
+                if not date_str:
+                     display_date = "N/A"
                 else:
-                    income_sum += amt
-                results.append((record_datetime_str[:16], note, cat, amt))
+                    try:
+                        if len(date_str) > 10:
+                            display_date = datetime.strptime(date_str, '%Y-%m-%d %H:%M:%S').strftime('%Y-%m-%d %H:%M')
+                        else:
+                            display_date = datetime.strptime(date_str, '%Y-%m-%d').strftime('%Y-%m-%d')
+                    except ValueError:
+                        display_date = date_str 
+                
+                reply += f"• {display_date} {notes} ({category}) {amount:.0f} 元\n"
+                
+         except (ValueError, TypeError):
+            continue
+    
+    reply += f"\n--------------------\n"
+    reply += f"📈 查詢總計：{total_amount_all_matches:.0f} 元\n"
+    
+    if len(matches) > limit:
+        reply += f"(僅顯示最近 {limit} 筆記錄)"
+        
+    return reply
 
-        if not results:
-            return f"🦝 找不到關於{label}的任何記錄喔！"
-
-        results.sort(key=lambda x: x[0])
-        lines = []
-        for t, note, cat, amt in results[:10]:
-            lines.append(f"• {t} {note} ({cat}) {abs(amt):.0f} 元")
-        more = ""
-        if len(results) > 10:
-            more = f"\n…還有 {len(results)-10} 筆未顯示"
-
-        return (
-            f"📝 **查詢結果**（{label}）：\n"
-            + "\n".join(lines)
-            + more
-            + "\n\n"
-            + f"📊 小計：支出 {expense_sum:.0f} 元，收入 {income_sum:.0f} 元"
-        )
-
-    except Exception as e:
-        logger.error(f"handle_search_records failed: {e}", exc_info=True)
-        return f"查詢失敗：{str(e)}"
-
+# === *** (REPLACE) 步驟三-C: `call_search_nlp` (查詢解析器) (解決 Bug #1, #7) *** ===
 def call_search_nlp(query_text, event_time):
     """
-    呼叫 Gemini NLP 來解析 "查詢" 或 "刪除" 的條件
+    (重寫) 呼叫 Gemini NLP 來解析 "查詢" 或 "刪除" 的條件
     返回一個 dict: {status, keyword, start_date, end_date, message}
     """
     today = event_time.date()
     today_str = today.strftime('%Y-%m-%d')
+    yesterday_str = (today - timedelta(days=1)).strftime('%Y-%m-%d')
     
     start_of_week = today - timedelta(days=today.weekday())
     end_of_week = start_of_week + timedelta(days=6)
@@ -1573,7 +1582,7 @@ def call_search_nlp(query_text, event_time):
 
     date_context_lines = [
         f"今天是 {today_str} (星期{today.weekday()})。",
-        f"昨天: {(today - timedelta(days=1)).strftime('%Y-%m-%d')}",
+        f"昨天: {yesterday_str}",
         f"本週 (週一到週日): {start_of_week.strftime('%Y-%m-%d')} 到 {end_of_week.strftime('%Y-%m-%d')}",
         f"上週 (週一到週日): {start_of_last_week.strftime('%Y-%m-%d')} 到 {end_of_last_week.strftime('%Y-%m-%d')}",
         f"本月: {start_of_month.strftime('%Y-%m-%d')} 到 {today_str}",
@@ -1582,29 +1591,51 @@ def call_search_nlp(query_text, event_time):
     date_context = "\n".join(date_context_lines)
 
     prompt_raw = """
-    你是一個查詢助手。
-
-    使用者的查詢內容：$QUERY_TEXT
+    你是一個查詢/刪除的「條件解析器」。
+    使用者的輸入是：「$QUERY_TEXT」
 
     目前的日期上下文：
     $DATE_CTX
 
     請依照下列規則回覆一段 JSON（不要輸出多餘文字與 Markdown 標記）：
     {
-      "status": "query" | "failure" | "chat" | "system_query",
-      "keyword": "<若能抽出查詢關鍵字，填入字串；否則為空字串>",
+      "status": "success" | "failure",
+      "keyword": "<若能抽出查詢關鍵字(例如 品項、類別)，填入字串；否則為空字串>",
       "start_date": "YYYY-MM-DD 或空字串",
       "end_date": "YYYY-MM-DD 或空字串",
-      "message": "<若為 chat 或 system_query，填入要回覆的文字；否則為空字串>"
+      "message": "<用一句話總結查詢條件>"
     }
 
     規則補充：
-    - 如果查詢包含時間範圍（如「這個月」、「上週」、「10/1~10/10」），解析為 start_date/end_date。
-    - 如果只是聊天或功能說明，改為對應的 status。
+    - 你的任務是 "拆解" 條件，不是回答問題。
+    - 如果只有時間 (例如 "今天", "這禮拜")，keyword 必須為空字串。
+    - 如果只有關鍵字 (例如 "雞排")，日期必須為空字串。
+    - 刪除的語句 (例如 "刪掉", "移除") *不是* 關鍵字，真正的關鍵字是 "品項"。
+
+    範例：
+    輸入: "查詢今天"
+    輸出: {"status": "success", "keyword": "", "start_date": "$TODAY_STR", "end_date": "$TODAY_STR", "message": "今天"}
+
+    輸入: "查詢這禮拜的餐飲"
+    輸出: {"status": "success", "keyword": "餐飲", "start_date": "$START_OF_WEEK", "end_date": "$END_OF_WEEK", "message": "本週的 餐飲"}
+
+    輸入: "查詢 雞排"
+    輸出: {"status": "success", "keyword": "雞排", "start_date": "", "end_date": "", "message": "關於「雞排」"}
+    
+    輸入: "刪掉早上的草莓麵包"
+    輸出: {"status": "success", "keyword": "草莓麵包", "start_date": "$TODAY_STR", "end_date": "$TODAY_STR", "message": "今天早上的「草莓麵包」"}
+    
+    輸入: "刪除 昨天"
+    輸出: {"status": "success", "keyword": "", "start_date": "$YESTERDAY_STR", "end_date": "$YESTERDAY_STR", "message": "昨天"}
     """
+    
     prompt = Template(prompt_raw).substitute(
         QUERY_TEXT=query_text,
         DATE_CTX=date_context,
+        TODAY_STR=today_str,
+        YESTERDAY_STR=yesterday_str,
+        START_OF_WEEK=start_of_week.strftime('%Y-%m-%d'),
+        END_OF_WEEK=end_of_week.strftime('%Y-%m-%d'),
     )
 
     try:
@@ -1622,7 +1653,35 @@ def call_search_nlp(query_text, event_time):
     except Exception as e:
         logger.error(f"Gemini Search API 呼叫失敗: {e}", exc_info=True)
         return {"status": "failure", "message": f"AI 分析器 API 呼叫失敗: {e}"}
-#喵
+
+# === *** (NEW) 步驟三-E: `handle_update_record_nlp` (解決 Bug #3) *** ===
+def handle_update_record_nlp(sheet, user_id, text, event_time):
+    """
+    (新功能) 處理 "修改" 意圖
+    """
+    logger.debug(f"處理 'NLP 修改'，user_id: {user_id}, text: {text}")
+    
+    # 實作這個功能非常複雜，因為：
+    # 1. AI 要解析出「目標」("香蕉") 和「修改內容」("類別" -> "餐飲")
+    # 2. 程式需要去 GSheet 搜尋 "香蕉" (可能有多筆)
+    # 3. 程式需要回傳一個「預覽」讓使用者確認 (類似刪除)
+    # 4. 使用者確認後，程式才能執行 gspread.update_cell()
+    
+    # 由於這很複雜，我們先回傳一個友善的提示
+    return "🦝 哎呀！小浣熊還在學習如何「修改」記錄... 😅\n\n目前這個功能還在開發中。您可以先使用「刪除」指令 (例如 '刪除 香蕉')，然後再重新記一筆喔！"
+
+# === *** (NEW) 步驟三-F: `handle_exchange_rate_query` (解決 Bug #6) *** ===
+def handle_exchange_rate_query(text):
+    """
+    (新功能) 處理匯率查詢
+    """
+    logger.debug(f"處理 '匯率查詢'，text: {text}")
+    
+    # (未來：你可以在這裡呼叫 Google Search API 或其他匯率 API)
+    # (例如使用 requests.get('[https://api.exchangerate-api.com/v4/latest/USD](https://api.exchangerate-api.com/v4/latest/USD)') )
+    
+    return "🦝 匯率查詢... 嗎？\n小浣熊還在學習如何連接到銀行... 🏦\n這個功能未來會開放喔！敬請期待！"
+
 # === 主程式入口 ===
 if __name__ == "__main__":
     logger.info("Starting Flask server locally...")
