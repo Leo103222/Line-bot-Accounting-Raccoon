@@ -20,6 +20,8 @@ import math # 用於本地解析
 APP_TZ = os.getenv('APP_TZ', 'Asia/Taipei')
 TIMEZONE = ZoneInfo(APP_TZ)
 
+# === (NEW) 步驟一：定義預設類別 (全域) ===
+DEFAULT_CATEGORIES = ['餐飲', '飲料', '交通', '娛樂', '購物', '日用品', '雜項', '收入']
 
 # === 配置日誌 ===
 logging.basicConfig(level=logging.DEBUG, format='%(asctime)s - %(name)s - %(levelname)s - %(message)s')
@@ -92,10 +94,11 @@ def get_sheets_workbook():
 
 def ensure_worksheets(workbook):
     """
-    確保 Google Sheet 中存在 Transactions 和 Budgets 工作表
+    (MODIFIED) 確保 Google Sheet 中存在 Transactions, Budgets, Categories 工作表
     """
-    logger.debug("檢查並確保 Transactions 和 Budgets 工作表存在...")
+    logger.debug("檢查並確保 Transactions, Budgets, Categories 工作表存在...")
     try:
+        # --- Transactions Sheet ---
         try:
             trx_sheet = workbook.worksheet('Transactions')
             logger.debug("找到 Transactions 工作表")
@@ -109,6 +112,7 @@ def ensure_worksheets(workbook):
             trx_sheet = workbook.add_worksheet(title='Transactions', rows=1000, cols=10)
             trx_sheet.append_row(['日期', '類別', '金額', '使用者ID', '使用者名稱', '備註'])
 
+        # --- Budgets Sheet ---
         try:
             budget_sheet = workbook.worksheet('Budgets')
             logger.debug("找到 Budgets 工作表")
@@ -122,10 +126,25 @@ def ensure_worksheets(workbook):
             budget_sheet = workbook.add_worksheet(title='Budgets', rows=100, cols=5)
             budget_sheet.append_row(['使用者ID', '類別', '限額'])
 
-        return trx_sheet, budget_sheet
+        # --- (NEW) Categories Sheet ---
+        try:
+            cat_sheet = workbook.worksheet('Categories')
+            logger.debug("找到 Categories 工作表")
+            header_cat = cat_sheet.row_values(1)
+            if not header_cat:
+                logger.debug("Categories 工作表為空，正在寫入標頭...")
+                cat_sheet.append_row(['使用者ID', '類別'])
+                
+        except gspread.exceptions.WorksheetNotFound:
+            logger.debug("未找到 Categories 工作表，正在創建...")
+            cat_sheet = workbook.add_worksheet(title='Categories', rows=100, cols=5)
+            cat_sheet.append_row(['使用者ID', '類別'])
+
+        return trx_sheet, budget_sheet, cat_sheet # (MODIFIED) 回傳三個工作表
+        
     except Exception as e:
         logger.error(f"創建或檢查工作表失敗：{e}", exc_info=True)
-        return None, None
+        return None, None, None
 
 def get_user_profile_name(user_id):
     """
@@ -139,7 +158,117 @@ def get_user_profile_name(user_id):
         logger.error(f"無法獲取使用者 {user_id} 的個人資料：{e}", exc_info=True)
         return "未知用戶"
 
-# === (FIXED) 意圖分類器 (修正 $ 符號錯誤) ===
+# === (NEW) 步驟三：新增類別管理相關函式 ===
+
+def get_user_categories(cat_sheet, user_id):
+    """
+    (新) 輔助函式：獲取使用者的完整類別列表 (預設 + 自訂)
+    """
+    logger.debug(f"正在獲取 {user_id} 的自訂類別...")
+    try:
+        all_cats_records = cat_sheet.get_all_records()
+        custom_cats = []
+        for r in all_cats_records:
+            if r.get('使用者ID') == user_id and r.get('類別'):
+                custom_cats.append(r.get('類別'))
+        
+        # 合併預設與自訂，並用 dict.fromkeys 技巧去除重複 (同時保持順序)
+        full_list = list(dict.fromkeys(DEFAULT_CATEGORIES + custom_cats))
+        
+        logger.debug(f"使用者 {user_id} 的完整類別：{full_list}")
+        return full_list
+    except Exception as e:
+        logger.error(f"獲取 {user_id} 的自訂類別失敗：{e}", exc_info=True)
+        return DEFAULT_CATEGORIES # 發生錯誤時，退回僅使用預設類別
+
+def handle_list_categories(cat_sheet, user_id):
+    """
+    (新) 處理「我的類別」指令
+    """
+    logger.debug(f"處理 '我的類別'，user_id: {user_id}")
+    user_cats = get_user_categories(cat_sheet, user_id)
+    custom_cats = [c for c in user_cats if c not in DEFAULT_CATEGORIES]
+    
+    reply = "🦝 **您的類別清單**：\n\n"
+    reply += "--- 預設類別 ---\n"
+    reply += " ".join(f"• {c}" for c in DEFAULT_CATEGORIES) + "\n\n"
+    
+    if custom_cats:
+        reply += "--- 您的自訂類別 ---\n"
+        reply += " ".join(f"• {c}" for c in custom_cats) + "\n\n"
+    else:
+        reply += "--- 您的自訂類別 ---\n(您尚未新增任何自訂類別)\n\n"
+    
+    reply += "💡 您可以使用「新增類別 [名稱]」來增加喔！\n💡 「刪除類別 [名稱]」可移除自訂類別。"
+    return reply
+
+def handle_add_category(cat_sheet, user_id, text):
+    """
+    (新) 處理「新增類別」指令
+    """
+    logger.debug(f"處理 '新增類別'，user_id: {user_id}, text: {text}")
+    match = re.match(r'(新增類別|增加類別)\s+(.+)', text)
+    if not match:
+        return "格式錯誤！請輸入「新增類別 [名稱]」\n例如：「新增類別 寵物」"
+    
+    new_cat = match.group(2).strip()
+    if not new_cat:
+        return "類別名稱不可為空喔！"
+    if len(new_cat) > 10:
+        return "🦝 類別名稱太長了（最多10個字）！"
+    if new_cat in DEFAULT_CATEGORIES:
+        return f"🦝 「{new_cat}」是預設類別，不用新增喔！"
+    
+    try:
+        # 檢查是否已存在
+        all_cats_records = cat_sheet.get_all_records()
+        for r in all_cats_records:
+            if r.get('使用者ID') == user_id and r.get('類別') == new_cat:
+                return f"🦝 嘿！「{new_cat}」已經在您的類別中了～"
+        
+        # 新增
+        cat_sheet.append_row([user_id, new_cat])
+        logger.info(f"使用者 {user_id} 成功新增類別：{new_cat}")
+        return f"✅ 成功新增類別：「{new_cat}」！"
+    except Exception as e:
+        logger.error(f"新增類別失敗：{e}", exc_info=True)
+        return f"新增類別時發生錯誤：{str(e)}"
+
+def handle_delete_category(cat_sheet, user_id, text):
+    """
+    (新) 處理「刪除類別」指令
+    """
+    logger.debug(f"處理 '刪除類別'，user_id: {user_id}, text: {text}")
+    match = re.match(r'(刪除類別|移除類別)\s+(.+)', text)
+    if not match:
+        return "格式錯誤！請輸入「刪除類別 [名稱]」\n例如：「刪除類別 寵物」"
+    
+    cat_to_delete = match.group(2).strip()
+    if cat_to_delete in DEFAULT_CATEGORIES:
+        return f"🦝 「{cat_to_delete}」是預設類別，不可以刪除喔！"
+    
+    try:
+        all_values = cat_sheet.get_all_values()
+        row_to_delete_index = -1
+        # 從後面開始找，確保找到最新的 (雖然理論上不該重複)
+        for i in range(len(all_values) - 1, 0, -1): 
+            row = all_values[i]
+            # 確保欄位存在
+            if len(row) > 1 and row[0] == user_id and row[1] == cat_to_delete:
+                row_to_delete_index = i + 1 # GSheet row index is 1-based
+                break
+        
+        if row_to_delete_index != -1:
+            cat_sheet.delete_rows(row_to_delete_index)
+            logger.info(f"使用者 {user_id} 成功刪除類別：{cat_to_delete}")
+            return f"🗑️ 已刪除您的自訂類別：「{cat_to_delete}」"
+        else:
+            return f"🦝 找不到您的自訂類別：「{cat_to_delete}」"
+    except Exception as e:
+        logger.error(f"刪除類別失敗：{e}", exc_info=True)
+        return f"刪除類別時發生錯誤：{str(e)}"
+
+# === (MODIFIED) 意圖分類器 (新增 MANAGE_CATEGORIES) ===
 def get_user_intent(text, event_time):
     """
     使用 Gemini 判斷使用者的 "主要意圖"
@@ -156,7 +285,7 @@ def get_user_intent(text, event_time):
 
     你的*唯一*任務是判斷使用者的主要意圖。請嚴格回傳以下 JSON 格式：
     {
-      "intent": "RECORD" | "DELETE" | "UPDATE" | "QUERY_DATA" | "QUERY_REPORT" | "QUERY_ADVICE" | "MANAGE_BUDGET" | "NEW_FEATURE_EXCHANGE_RATE" | "HELP" | "CHAT" | "UNKNOWN"
+      "intent": "RECORD" | "DELETE" | "UPDATE" | "QUERY_DATA" | "QUERY_REPORT" | "QUERY_ADVICE" | "MANAGE_BUDGET" | "MANAGE_CATEGORIES" | "NEW_FEATURE_EXCHANGE_RATE" | "HELP" | "CHAT" | "UNKNOWN"
     }
 
     判斷規則：
@@ -167,6 +296,7 @@ def get_user_intent(text, event_time):
     - QUERY_REPORT: 查詢*匯總報表* (例如 "查帳", "月結", "本週重點", "總收支分析")
     - QUERY_ADVICE: 詢問*建議* (例如 "我本月花太多嗎？", "有什麼建議")
     - MANAGE_BUDGET: 設定或查看預算 (例如 "設置預算", "查看預算", "我還剩多少預算？")
+    - MANAGE_CATEGORIES: (新) 新增、刪除或查詢類別 (例如 "新增類別 寵物", "我的類別", "有哪些類別？")
     - NEW_FEATURE_EXCHANGE_RATE: 詢問金融功能，特別是匯率 (例如 "美金匯率", "100 USD = ? TWD")
     - HELP: 請求幫助 (例如 "幫助", "你會幹嘛")
     - CHAT: 閒聊 (例如 "你好", "謝謝", "你是誰")
@@ -175,13 +305,13 @@ def get_user_intent(text, event_time):
     範例：
     輸入: "刪掉早上的草莓麵包$$55" -> {"intent": "DELETE"}
     輸入: "查詢今天" -> {"intent": "QUERY_DATA"}
-    輸入: "香蕉能改為餐飲嗎？" -> {"intent": "UPDATE"}
     輸入: "有什麼建議" -> {"intent": "QUERY_ADVICE"}
     輸入: "美金匯率" -> {"intent": "NEW_FEATURE_EXCHANGE_RATE"}
     輸入: "月結" -> {"intent": "QUERY_REPORT"}
-    輸入: "目前收入 39020 支出 45229" -> {"intent": "RECORD"}
-    輸入: "香蕉 20" -> {"intent": "RECORD"}
     輸入: "我還剩多少預算？" -> {"intent": "MANAGE_BUDGET"}
+    輸入: "新增類別 寵物" -> {"intent": "MANAGE_CATEGORIES"}
+    輸入: "我的類別" -> {"intent": "MANAGE_CATEGORIES"}
+    輸入: "有哪些類別？" -> {"intent": "MANAGE_CATEGORIES"}
     """
     prompt = Template(prompt_raw).substitute(
         TEXT=text,
@@ -261,30 +391,27 @@ def handle_message(event):
             "💸 **自然記帳** (AI會幫你分析)：\n"
             "   - 「今天中午吃了雞排80」\n"
             "   - 「昨天喝飲料 50」\n"
-            "   - 「16:22 買零食 100」\n"
-            "   - 「午餐100 晚餐200」\n"
-            "   - 「水果條59x2 + 奶茶35」\n\n"
-            "📊 **分析查詢**：\n"
-            "   - 「查帳」/「總收支分析」：(推薦) 分析所有時間的支出類別\n"
-            "   - 「月結」：分析這個月的收支總結\n"
-            "   - 「本週重點」：分析本週的支出類別\n\n"
+            "   - 「午餐100 晚餐200」\n\n"
+            "📊 **分析查詢** (推薦使用圖文選單)：\n"
+            "   - 「總收支分析」：分析所有時間\n"
+            "   - 「月結」：分析這個月\n"
+            "   - 「本週重點」：分析本週\n\n"
             "🔎 **自然語言查詢**：\n"
             "   - 「查詢 雞排」\n"
             "   - 「查詢 這禮拜的餐飲」\n"
-            "   - 「查詢 上個月的收入」/「查詢 昨日支出」\n"
-            "   - 「我本月花太多嗎？」\n"
-            "   - 「我還剩多少預算？」\n\n"
+            "   - 「查詢 上個月的收入」\n"
+            "   - 「我本月花太多嗎？」\n\n"
             "🗑️ **刪除**：\n"
             "   - 「刪除」：(安全) 移除您最近一筆記錄\n"
             "   - 「刪除 雞排」：預覽將刪除的記錄\n"
-            "   - 「刪掉 昨天」：(AI) 預覽昨天的記錄\n"
             "   - 「確認刪除」：確認執行刪除（需先預覽）\n\n"
             "💡 **預算**：\n"
             "   - 「設置預算 餐飲 3000」\n"
             "   - 「查看預算」：檢查本月預算使用情況\n\n"
-            "ℹ️ **其他**：\n"
-            "   - 「有哪些類別？」：查看所有記帳項目\n"
-            " 類別: 🍽️ 餐飲 🥤 飲料 🚌 交通 🎬 娛樂 🛍️ 購物 🧴 日用品 💡 雜項💰 收入"
+            "✨ **(新) 自訂類別**：\n"
+            "   - 「我的類別」：查看所有類別\n"
+            "   - 「新增類別 [名稱]」 (例如: 新增類別 寵物)\n"
+            "   - 「刪除類別 [名稱]」 (僅限自訂類別)"
         )
         
         try:
@@ -308,10 +435,10 @@ def handle_message(event):
             logger.error(f"回覆 Google Sheets 錯誤訊息失敗：{e_reply}", exc_info=True)
         return
 
-    # 確保工作表存在
-    trx_sheet, budget_sheet = ensure_worksheets(workbook)
-    if not trx_sheet or not budget_sheet:
-        reply_text = "糟糕！無法創建或存取 'Transactions' 或 'Budgets' 工作表。"
+    # (MODIFIED) 確保工作表存在 (現在有 3 個)
+    trx_sheet, budget_sheet, cat_sheet = ensure_worksheets(workbook)
+    if not trx_sheet or not budget_sheet or not cat_sheet:
+        reply_text = "糟糕！無法創建或存取 'Transactions', 'Budgets' 或 'Categories' 工作表。"
         try:
             line_bot_api.reply_message(reply_token, TextSendMessage(text=reply_text))
         except LineBotApiError as e:
@@ -331,24 +458,33 @@ def handle_message(event):
         # --- 報表查詢 (QUERY_REPORT) ---
         elif user_intent == "QUERY_REPORT":
             logger.debug("意圖：QUERY_REPORT (查詢報表)")
-            
-            # === *** (FIX) 步驟二：合併 `查帳` 與 `總收支分析` *** ===
             if "查帳" in text or "總收支" in text or "總分析" in text:
                 reply_text = handle_total_analysis(trx_sheet, user_id)
             elif "月結" in text:
                 reply_text = handle_monthly_report(trx_sheet, user_id, event_time)
             elif "週" in text or "周" in text: 
                 reply_text = handle_weekly_report(trx_sheet, user_id, event_time)
-            else: # AI 判斷是報表，但關鍵字沒對上，交給 NLP 查詢
+            else: 
                 reply_text = handle_search_records_nlp(trx_sheet, user_id, text, event_time)
         
         # --- 預算管理 (MANAGE_BUDGET) ---
         elif user_intent == "MANAGE_BUDGET":
             logger.debug("意圖：MANAGE_BUDGET (預算管理)")
             if text.startswith("設置預算"):
-                reply_text = handle_set_budget(budget_sheet, text, user_id)
+                # (MODIFIED) 傳入 cat_sheet
+                reply_text = handle_set_budget(budget_sheet, cat_sheet, text, user_id)
             else: 
                 reply_text = handle_view_budget(trx_sheet, budget_sheet, user_id, event_time)
+
+        # --- (NEW) 類別管理 (MANAGE_CATEGORIES) ---
+        elif user_intent == "MANAGE_CATEGORIES":
+            logger.debug("意圖：MANAGE_CATEGORIES (類別管理)")
+            if "新增" in text or "增加" in text:
+                reply_text = handle_add_category(cat_sheet, user_id, text)
+            elif "刪除" in text or "移除" in text:
+                reply_text = handle_delete_category(cat_sheet, user_id, text)
+            else: # "我的類別", "有哪些類別", etc.
+                reply_text = handle_list_categories(cat_sheet, user_id)
 
         # --- 刪除 (DELETE) ---
         elif user_intent == "DELETE":
@@ -384,19 +520,19 @@ def handle_message(event):
         elif user_intent == "RECORD":
             logger.debug("意圖：RECORD (記帳)")
             user_name = get_user_profile_name(user_id)
-            reply_text = handle_nlp_record(trx_sheet, budget_sheet, text, user_id, user_name, event_time)
+            # (MODIFIED) 傳入 cat_sheet
+            reply_text = handle_nlp_record(trx_sheet, budget_sheet, cat_sheet, text, user_id, user_name, event_time)
         
         # --- 聊天 (CHAT) ---
-        # === *** (FIX) 步驟一：改用 `handle_chat_nlp` *** ===
         elif user_intent == "CHAT":
             logger.debug("意圖：CHAT (聊天)")
             reply_text = handle_chat_nlp(text)
         
         else: # UNKNOWN 
             logger.warning(f"未知的意圖 '{user_intent}'，當作聊天或記帳處理。")
-            # 降級：如果意圖不清晰，還是嘗試用記帳的 NLP
+            # (MODIFIED) 傳入 cat_sheet
             user_name = get_user_profile_name(user_id)
-            reply_text = handle_nlp_record(trx_sheet, budget_sheet, text, user_id, user_name, event_time)
+            reply_text = handle_nlp_record(trx_sheet, budget_sheet, cat_sheet, text, user_id, user_name, event_time)
 
     except Exception as e:
         logger.error(f"處理意圖 '{user_intent}' 失敗：{e}", exc_info=True)
@@ -436,6 +572,11 @@ def get_cute_reply(category):
     }
     default_replies = ["✅ 記錄完成！", "OK！記好囉！ ✍️", "小浣熊收到！ 🦝"]
     
+    # (MODIFIED) 如果是自訂類別，但 AI 還是回傳了「娛樂」的可愛回應 (例如 Bug B)，
+    # 這裡做一個保險，如果是收入，強制蓋過。
+    if category == "收入":
+        return random.choice(replies["收入"])
+        
     category_replies = replies.get(category, default_replies)
     return random.choice(category_replies)
 
@@ -535,18 +676,31 @@ def _try_collapse_add_expr_from_text(original_text: str, records: list):
     }]
     return collapsed, True
 
-# === (MODIFIED) `handle_nlp_record` (記帳) (優化 Prompt) ===
-def handle_nlp_record(sheet, budget_sheet, text, user_id, user_name, event_time):
+# === (MODIFIED) `handle_nlp_record` (記帳) (動態類別 + Bug 修正) ===
+def handle_nlp_record(sheet, budget_sheet, cat_sheet, text, user_id, user_name, event_time):
     """
-    使用 Gemini NLP 處理自然語言記帳 (記帳、聊天、查詢、系統問題)
+    (MODIFIED) 使用 Gemini NLP 處理自然語言記帳 (記帳、聊天、查詢、系統問題)
     """
     logger.debug(f"處理自然語言記帳指令：{text}")
+
+    # === (NEW) 步驟一：動態獲取使用者的類別 ===
+    try:
+        user_categories = get_user_categories(cat_sheet, user_id)
+        # 產生給 AI 看的格式，例如: "餐飲", "飲料", "寵物"
+        user_categories_list_str = ", ".join(f'"{c}"' for c in user_categories)
+        # 產生給 AI JSON 用的格式，例如: "餐飲" | "飲料" | "寵物"
+        user_categories_pipe_str = " | ".join(f'"{c}"' for c in user_categories)
+    except Exception as e:
+        logger.error(f"獲取動態類別失敗: {e}，將退回預設類別")
+        user_categories = DEFAULT_CATEGORIES
+        user_categories_list_str = ", ".join(f'"{c}"' for c in user_categories)
+        user_categories_pipe_str = " | ".join(f'"{c}"' for c in user_categories)
     
     current_time_str = event_time.strftime('%Y-%m-%d %H:%M:%S')
     today_str = event_time.strftime('%Y-%m-%d')
     
     date_context_lines = [
-        f"今天是 {today_str} (星期{event_time.weekday()})。",
+        f"今天是 {today_str} (星期{event_time.weekday()}).",
         f"使用者傳送時間是: {event_time.strftime('%H:%M:%S')}",
         "日期參考：",
         f"- 昨天: {(event_time.date() - timedelta(days=1)).strftime('%Y-%m-%d')}"
@@ -568,7 +722,7 @@ def handle_nlp_record(sheet, budget_sheet, text, user_id, user_name, event_time)
       "data": [
         {
           "datetime": "YYYY-MM-DD HH:MM:SS",
-          "category": "餐飲" | "飲料" | "交通" | "娛樂" | "購物" | "日用品" | "雜項" | "收入",
+          "category": $USER_CATEGORIES_PIPE,
           "amount": <number>,
           "notes": "<string>"
         }
@@ -586,10 +740,10 @@ def handle_nlp_record(sheet, budget_sheet, text, user_id, user_name, event_time)
            - **(規則 3) 時段關鍵字 (僅供參考)**:
                - 如果使用者輸入 "早餐 50"，且「傳送時間」是 09:30，則判斷為補記帳，使用 $TODAY 08:00:00。
                - 如果使用者輸入 "午餐 100"，且「傳送時間」是 14:00，則判斷為補記帳，使用 $TODAY 12:00:00。
-               - 如果使用者輸入 "下午茶 100"，且「傳送時間」是 19:36，**此時「傳送時間」(19:36) 與 "下午茶" (15:00) 差距過大，應判斷 "下午茶" 只是「備註」，套用 "規則 2」，必須使用 $CURRENT_TIME**。
-               - "晚餐" (18:00), "宵夜" (23:00) 邏輯同上。
+               - **(新規則 3.1)** 如果使用者輸入的「備註」*同時包含*品項和時段 (例如 "麥當勞早餐 80", "宵夜雞排 90")，請*優先*套用時段時間 (例如 "麥當勞早餐 80" -> `datetime: "$TODAY 08:00:00"`, `category: "餐飲"`, `notes: "麥當勞早餐"`)。
+               - **(原規則 3.2)** 如果時段與傳送時間差距過大 (例如 19:36 傳送 "下午茶 100")，才將 "下午茶" 視為備註，套用規則 2。
 
-       - category: 必須是 [餐飲, 飲料, 交通, 娛樂, 購物, 日用品, 雜項, 收入] 之一。
+       - category: (動態) 必須是 [ $USER_CATEGORIES_LIST ] 之一。
          (例如："香蕉 20" 應歸類為 "餐飲" 或 "購物"，而非 "雜項")
        - amount: 支出必須為負數 (-)，收入必須為正數 (+)。
        - notes: 盡可能擷取出花費的項目。
@@ -601,33 +755,25 @@ def handle_nlp_record(sheet, budget_sheet, text, user_id, user_name, event_time)
     5. status "failure": 如果看起來像記帳，但缺少關鍵資訊 (例如 "雞排" (沒說金額))。
 
     ⚠️ 規則補充：
-    - 如果使用者輸入金額中有「+」或「x/＊」符號（例如 "晚餐180+60+135"、"飲料59x2"），請將它們視為「單一筆記帳」的運算表達式，**計算總和**後輸出一筆金額，而不是拆成多筆。
-      例如：
-      輸入: "晚餐180+60+135" -> {"status": "success", "data": [{"datetime": "$TODAY 18:00:00", "category": "餐飲", "amount": -375, "notes": "晚餐"}], "message": "記錄成功"}
-      輸入: "飲料59x2" -> {"status": "success", "data": [{"datetime": "$CURRENT_TIME", "category": "飲料", "amount": -118, "notes": "飲料"}], "message": "記錄成功"}
+    - (運算子規則) 如果使用者輸入金額中有「+」或「x/＊」符號（例如 "晚餐180+60+135"、"飲料59x2"），請將它們視為「單一筆記帳」的運算表達式，**計算總和**後輸出一筆金額，而不是拆成多筆。
+    - **(新！收入判斷)**: 如果使用者明確提到 "贏"、"賺"、"撿到"、"收到" (例如 "打牌 贏30", "賺 500")，*無論*上下文是什麼，都*必須* 歸類為 `"category": "收入"` 且 `amount` 為*正數* (+)。
 
     範例：
     輸入: "今天中午吃了雞排80" (規則 1) -> {"status": "success", "data": [{"datetime": "$TODAY 12:00:00", "category": "餐飲", "amount": -80, "notes": "雞排"}], "message": "記錄成功"}
-    
-    # (Bug #2 優化)
     輸入: "香蕉 20" (規則 2) -> {"status": "success", "data": [{"datetime": "$CURRENT_TIME", "category": "餐飲", "amount": -20, "notes": "香蕉"}], "message": "記錄成功"}
     
-    # (Bug #4 優化)
+    # (Bug A Fix)
+    輸入: "麥當勞早餐 80" (規則 3.1) -> {"status": "success", "data": [{"datetime": "$TODAY 08:00:00", "category": "餐飲", "amount": -80, "notes": "麥當勞早餐"}], "message": "記錄成功"}
+    
+    # (Bug B Fix)
+    輸入: "打牌 贏30元" -> {"status": "success", "data": [{"datetime": "$CURRENT_TIME", "category": "收入", "amount": 30, "notes": "打牌 贏"}], "message": "記錄成功"}
+
     輸入: "目前收入 39020 支出 45229" (規則 2) -> {"status": "success", "data": [{"datetime": "$CURRENT_TIME", "category": "收入", "amount": 39020, "notes": "目前收入"}, {"datetime": "$CURRENT_TIME", "category": "雜項", "amount": -45229, "notes": "支出"}], "message": "記錄成功"}
-
     輸入: "午餐100 晚餐200" (規則 3) -> {"status": "success", "data": [{"datetime": "$TODAY 12:00:00", "category": "餐飲", "amount": -100, "notes": "午餐"}, {"datetime": "$TODAY 18:00:00", "category": "餐飲", "amount": -200, "notes": "晚餐"}], "message": "記錄成功"}
-    輸入: "ACE水果條59x2+龜甲萬豆乳紅茶35" (規則 2) -> {"status": "success", "data": [{"datetime": "$CURRENT_TIME", "category": "購物", "amount": -118, "notes": "ACE水果條 59x2"}, {"datetime": "$CURRENT_TIME", "category": "飲料", "amount": -35, "notes": "龜甲萬豆乳紅茶"}], "message": "記錄成功"}
-    輸入: "16:22 記帳零食 50" (規則 1) -> {"status": "success", "data": [{"datetime": "$TODAY 16:22:00", "category": "雜項", "amount": -50, "notes": "零食"}], "message": "記錄成功"}
-
-    **重要範例**（假設 $CURRENT_TIME = "2025-10-26 16:22:10"）：
-    輸入: "記帳零食 50" (規則 2) -> {"status": "success", "data": [{"datetime": "2025-10-26 16:22:10", "category": "雜項", "amount": -50, "notes": "零食"}], "message": "記錄成功"}
-
-    輸入: "下午茶 100"（假設 $CURRENT_TIME = "2025-10-26 19:36:00"；規則 3 判斷為備註 -> 套用規則 2） ->
-    {"status": "success", "data": [{"datetime": "2025-10-26 19:36:00", "category": "餐飲", "amount": -100, "notes": "下午茶"}], "message": "記錄成功"}
 
     輸入: "你好" -> {"status": "chat", "data": null, "message": "哈囉！我是記帳小浣熊🦝 需要幫忙記帳嗎？還是想聊聊天呀？"}
     輸入: "我本月花太多嗎？" -> {"status": "query", "data": null, "message": "我本月花太多嗎？"}
-    輸入: "目前有什麼項目?" -> {"status": "system_query", "data": null, "message": "請問您是指記帳的「類別」嗎？ 🦝\n預設類別有：🍽️ 餐飲 🥤 飲料 🚌 交通 🎬 娛樂 🛍️ 購物 🧴 日用品 💡 雜項 💰 收入"}
+    輸入: "目前有什麼項目?" -> {"status": "system_query", "data": null, "message": "請問您是指「我的類別」嗎？ 🦝 您可以輸入「我的類別」來查看喔！"}
     輸入: "宵夜" -> {"status": "failure", "data": null, "message": "🦝？ 宵夜吃了什麼？花了多少錢呢？"}
     """
     prompt = Template(prompt_raw).substitute(
@@ -635,6 +781,8 @@ def handle_nlp_record(sheet, budget_sheet, text, user_id, user_name, event_time)
         TODAY=today_str,
         TEXT=text,
         DATE_CTX=date_context,
+        USER_CATEGORIES_LIST=user_categories_list_str,
+        USER_CATEGORIES_PIPE=user_categories_pipe_str
     )
     
     try:
@@ -666,6 +814,12 @@ def handle_nlp_record(sheet, budget_sheet, text, user_id, user_name, event_time)
                 amount_str = record.get('amount', 0)
                 notes = record.get('notes', text)
                 
+                # (NEW) 類別驗證：檢查 AI 回傳的類別是否真的在允許的列表中
+                if category not in user_categories:
+                    logger.warning(f"AI 回傳了不在列表中的類別：'{category}'，已強制修正為 '雜項'")
+                    notes = f"({category}) {notes}" # 把 AI 的分類當成備註
+                    category = "雜項"
+                
                 try:
                     amount = float(amount_str)
                     if amount == 0:
@@ -688,6 +842,10 @@ def handle_nlp_record(sheet, budget_sheet, text, user_id, user_name, event_time)
             
             logger.debug("所有記錄寫入完畢")
 
+            # (Bug B Fix) 如果是收入，強制使用收入的回應
+            if any(float(r.get('amount', 0)) > 0 for r in records):
+                last_category = "收入"
+                
             cute_reply = get_cute_reply(last_category)
             warning_message = check_budget_warning(sheet, budget_sheet, user_id, last_category, event_time)
             
@@ -710,11 +868,12 @@ def handle_nlp_record(sheet, budget_sheet, text, user_id, user_name, event_time)
             )
 
         elif status == 'chat':
-            # (FIX) 轉交給新的 NLP 聊天函式
             return handle_chat_nlp(text)
         
         elif status == 'system_query':
-            return message or "我可以幫您記帳！ 🦝 預設類別有：餐飲, 飲料, 交通, 娛樂, 購物, 日用品, 雜項, 收入。"
+            # 現在 "有哪些類別" 應該會被 MANAGE_CATEGORIES 攔截
+            # 這裡變成一個備用的回覆
+            return message or "請問您是指「我的類別」嗎？ 🦝"
         
         elif status == 'query':
             logger.debug(f"NLP 偵測到聊天式查詢 '{text}'，轉交至 handle_conversational_query_advice")
@@ -1138,21 +1297,28 @@ def handle_confirm_delete(sheet, user_id, event_time):
             del delete_preview_cache[user_id]
         return f"刪除記錄時發生錯誤：{str(e)}"
 
-def handle_set_budget(sheet, text, user_id):
+def handle_set_budget(sheet, cat_sheet, text, user_id):
     """
-    處理 '設置預算' 指令
+    (MODIFIED) 處理 '設置預算' 指令 (使用動態類別)
     """
     logger.debug(f"處理 '設置預算' 指令，user_id: {user_id}, text: {text}")
-    match = re.match(r'設置預算\s+([\u4e00-\u9fa5]+)\s+(\d+)', text)
+    # (MODIFIED) 允許類別名稱包含英文和數字
+    match = re.match(r'設置預算\s+([\u4e00-\u9fa5a-zA-Z0-9]+)\s+(\d+)', text)
     if not match:
         return "格式錯誤！請輸入「設置預算 [類別] [限額]」，例如：「設置預算 餐飲 3000」"
     
     category = match.group(1).strip()
     limit = int(match.group(2)) 
     
-    valid_categories = ['餐飲', '飲料', '交通', '娛樂', '購物', '日用品', '雜項']
+    # (MODIFIED) 獲取使用者的動態類別列表
+    valid_categories = get_user_categories(cat_sheet, user_id)
+    
+    # 不能為「收入」設定預算
+    if category == "收入":
+        return "🦝 不能為「收入」設定支出預算喔！"
+        
     if category not in valid_categories:
-        return f"無效類別，請使用：{', '.join(valid_categories)}"
+        return f"無效類別！「{category}」不在您的類別清單中。\n請先使用「新增類別 {category}」"
 
     try:
         cell_list = sheet.findall(user_id)
@@ -1521,7 +1687,7 @@ def call_search_nlp(query_text, event_time):
     輸出: {"status": "success", "keyword": "雞排", "start_date": "", "end_date": "", "type": "all", "message": "關於「雞排」"}
     
     輸入: "刪掉早上的草莓麵包"
-    輸出: {"status": "success", "keyword": "草莓麵bao", "start_date": "$TODAY_STR", "end_date": "$TODAY_STR", "type": "all", "message": "今天早上的「草莓麵包」"}
+    輸出: {"status": "success", "keyword": "草莓麵包", "start_date": "$TODAY_STR", "end_date": "$TODAY_STR", "type": "all", "message": "今天早上的「草莓麵包」"}
     
     # (FIX #3) 新增 type 範例
     輸入: "查詢昨日支出"
