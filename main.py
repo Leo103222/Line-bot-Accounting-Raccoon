@@ -207,11 +207,15 @@ def handle_add_category(cat_sheet, user_id, text):
     (新) 處理「新增類別」指令
     """
     logger.debug(f"處理 '新增類別'，user_id: {user_id}, text: {text}")
-    match = re.match(r'(新增類別|增加類別)\s+(.+)', text)
+    # (MODIFIED) 1. \s+ 改為 \s* (允許沒有空格)
+    match = re.match(r'(新增類別|增加類別)\s*(.+)', text)
     if not match:
         return "格式錯誤！請輸入「新增類別 [名稱]」\n例如：「新增類別 寵物」"
     
+    # (MODIFIED) 2. 移除前後括號，例如 [交際應酬] -> 交際應酬
     new_cat = match.group(2).strip()
+    new_cat = re.sub(r'^[\[【(](.+?)[\]】)]$', r'\1', new_cat).strip()
+    
     if not new_cat:
         return "類別名稱不可為空喔！"
     if len(new_cat) > 10:
@@ -239,11 +243,15 @@ def handle_delete_category(cat_sheet, user_id, text):
     (新) 處理「刪除類別」指令
     """
     logger.debug(f"處理 '刪除類別'，user_id: {user_id}, text: {text}")
-    match = re.match(r'(刪除類別|移除類別)\s+(.+)', text)
+    # (MODIFIED) 1. \s+ 改為 \s* (允許沒有空格)
+    match = re.match(r'(刪除類別|移除類別)\s*(.+)', text)
     if not match:
         return "格式錯誤！請輸入「刪除類別 [名稱]」\n例如：「刪除類別 寵物」"
     
+    # (MODIFIED) 2. 移除前後括號
     cat_to_delete = match.group(2).strip()
+    cat_to_delete = re.sub(r'^[\[【(](.+?)[\]】)]$', r'\1', cat_to_delete).strip()
+
     if cat_to_delete in DEFAULT_CATEGORIES:
         return f"🦝 「{cat_to_delete}」是預設類別，不可以刪除喔！"
     
@@ -268,7 +276,7 @@ def handle_delete_category(cat_sheet, user_id, text):
         logger.error(f"刪除類別失敗：{e}", exc_info=True)
         return f"刪除類別時發生錯誤：{str(e)}"
 
-# === (MODIFIED) 意圖分類器 (新增 MANAGE_CATEGORIES) ===
+# === (MODIFIED) 意圖分類器 (修正「類別」誤判問題) ===
 def get_user_intent(text, event_time):
     """
     使用 Gemini 判斷使用者的 "主要意圖"
@@ -296,7 +304,8 @@ def get_user_intent(text, event_time):
     - QUERY_REPORT: 查詢*匯總報表* (例如 "查帳", "月結", "本週重點", "總收支分析")
     - QUERY_ADVICE: 詢問*建議* (例如 "我本月花太多嗎？", "有什麼建議")
     - MANAGE_BUDGET: 設定或查看預算 (例如 "設置預算", "查看預算", "我還剩多少預算？")
-    - MANAGE_CATEGORIES: (新) 新增、刪除或查詢類別 (例如 "新增類別 寵物", "我的類別", "有哪些類別？")
+    # (MODIFIED) 增加更多關鍵字
+    - MANAGE_CATEGORIES: (新) 新增、刪除或查詢類別 (例如 "新增類別 寵物", "我的類別", "有哪些類別？", "類別", "目前類別")
     - NEW_FEATURE_EXCHANGE_RATE: 詢問金融功能，特別是匯率 (例如 "美金匯率", "100 USD = ? TWD")
     - HELP: 請求幫助 (例如 "幫助", "你會幹嘛")
     - CHAT: 閒聊 (例如 "你好", "謝謝", "你是誰")
@@ -312,6 +321,9 @@ def get_user_intent(text, event_time):
     輸入: "新增類別 寵物" -> {"intent": "MANAGE_CATEGORIES"}
     輸入: "我的類別" -> {"intent": "MANAGE_CATEGORIES"}
     輸入: "有哪些類別？" -> {"intent": "MANAGE_CATEGORIES"}
+    # (MODIFIED) 增加新範例
+    輸入: "類別" -> {"intent": "MANAGE_CATEGORIES"}
+    輸入: "目前類別" -> {"intent": "MANAGE_CATEGORIES"}
     """
     prompt = Template(prompt_raw).substitute(
         TEXT=text,
@@ -386,8 +398,12 @@ def handle_message(event):
     
     # 1. 幫助指令 (優先)
     if text == "幫助":
+        # (MODIFIED) 動態產生預設類別列表
+        default_cat_str = " ".join(f"• {c}" for c in DEFAULT_CATEGORIES)
+        
+        # (MODIFIED) 使用 f-string 插入 default_cat_str
         reply_text = (
-            "📌 **記帳小浣熊使用說明🦝**：\n\n"
+            f"📌 **記帳小浣熊使用說明🦝**：\n\n"
             "💸 **自然記帳** (AI會幫你分析)：\n"
             "   - 「今天中午吃了雞排80」\n"
             "   - 「昨天喝飲料 50」\n"
@@ -408,8 +424,10 @@ def handle_message(event):
             "💡 **預算**：\n"
             "   - 「設置預算 餐飲 3000」\n"
             "   - 「查看預算」：檢查本月預算使用情況\n\n"
-            "✨ **(新) 自訂類別**：\n"
-            "   - 「我的類別」：查看所有類別\n"
+            "✨ **類別管理**：\n"
+            f"   --- 預設類別 ---\n   {default_cat_str}\n\n"
+            "   --- 自訂功能 ---\n"
+            "   - 「我的類別」：查看所有(含自訂)類別\n"
             "   - 「新增類別 [名稱]」 (例如: 新增類別 寵物)\n"
             "   - 「刪除類別 [名稱]」 (僅限自訂類別)"
         )
@@ -483,7 +501,7 @@ def handle_message(event):
                 reply_text = handle_add_category(cat_sheet, user_id, text)
             elif "刪除" in text or "移除" in text:
                 reply_text = handle_delete_category(cat_sheet, user_id, text)
-            else: # "我的類別", "有哪些類別", etc.
+            else: # "我的類別", "有哪些類別", "類別", "目前類別" etc.
                 reply_text = handle_list_categories(cat_sheet, user_id)
 
         # --- 刪除 (DELETE) ---
@@ -1687,7 +1705,7 @@ def call_search_nlp(query_text, event_time):
     輸出: {"status": "success", "keyword": "雞排", "start_date": "", "end_date": "", "type": "all", "message": "關於「雞排」"}
     
     輸入: "刪掉早上的草莓麵包"
-    輸出: {"status": "success", "keyword": "草莓麵包", "start_date": "$TODAY_STR", "end_date": "$TODAY_STR", "type": "all", "message": "今天早上的「草莓麵包」"}
+    輸出: {"status": "success", "keyword": "草莓麵B", "start_date": "$TODAY_STR", "end_date": "$TODAY_STR", "type": "all", "message": "今天早上的「草莓麵包」"}
     
     # (FIX #3) 新增 type 範例
     輸入: "查詢昨日支出"
