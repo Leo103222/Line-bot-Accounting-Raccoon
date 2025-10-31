@@ -205,14 +205,16 @@ def handle_list_categories(cat_sheet, user_id):
 def handle_add_category(cat_sheet, user_id, text):
     """
     (新) 處理「新增類別」指令
+    (MODIFIED) 使用 re.search 進行模糊比對
     """
     logger.debug(f"處理 '新增類別'，user_id: {user_id}, text: {text}")
     # (MODIFIED) 1. \s+ 改為 \s* (允許沒有空格)
-    match = re.match(r'(新增類別|增加類別)\s*(.+)', text)
+    # (MODIFIED) 2. re.match 改為 re.search (允許指令在句子中)
+    match = re.search(r'(新增類別|增加類別)\s*(.+)', text)
     if not match:
-        return "格式錯誤！請輸入「新增類別 [名稱]」\n例如：「新增類別 寵物」"
+        return "格式錯誤！請包含「新增類別 [名稱]」\n例如：「我想 新增類別 寵物」"
     
-    # (MODIFIED) 2. 移除前後括號，例如 [交際應酬] -> 交際應酬
+    # (MODIFIED) 3. 移除前後括號，例如 [交際應酬] -> 交際應酬
     new_cat = match.group(2).strip()
     new_cat = re.sub(r'^[\[【(](.+?)[\]】)]$', r'\1', new_cat).strip()
     
@@ -241,14 +243,16 @@ def handle_add_category(cat_sheet, user_id, text):
 def handle_delete_category(cat_sheet, user_id, text):
     """
     (新) 處理「刪除類別」指令
+    (MODIFIED) 使用 re.search 進行模糊比對
     """
     logger.debug(f"處理 '刪除類別'，user_id: {user_id}, text: {text}")
     # (MODIFIED) 1. \s+ 改為 \s* (允許沒有空格)
-    match = re.match(r'(刪除類別|移除類別)\s*(.+)', text)
+    # (MODIFIED) 2. re.match 改為 re.search (允許指令在句子中)
+    match = re.search(r'(刪除類別|移除類別)\s*(.+)', text)
     if not match:
-        return "格式錯誤！請輸入「刪除類別 [名稱]」\n例如：「刪除類別 寵物」"
+        return "格式錯誤！請包含「刪除類別 [名稱]」\n例如：「幫我 刪除類別 寵物」"
     
-    # (MODIFIED) 2. 移除前後括號
+    # (MODIFIED) 3. 移除前後括號
     cat_to_delete = match.group(2).strip()
     cat_to_delete = re.sub(r'^[\[【(](.+?)[\]】)]$', r'\1', cat_to_delete).strip()
 
@@ -276,7 +280,7 @@ def handle_delete_category(cat_sheet, user_id, text):
         logger.error(f"刪除類別失敗：{e}", exc_info=True)
         return f"刪除類別時發生錯誤：{str(e)}"
 
-# === (MODIFIED) 意圖分類器 (修正「類別」誤判問題) ===
+# === (MODIFIED) 意圖分類器 (強化模糊比對) ===
 def get_user_intent(text, event_time):
     """
     使用 Gemini 判斷使用者的 "主要意圖"
@@ -304,10 +308,9 @@ def get_user_intent(text, event_time):
     - QUERY_REPORT: 查詢*匯總報表* (例如 "查帳", "月結", "本週重點", "總收支分析")
     - QUERY_ADVICE: 詢問*建議* (例如 "我本月花太多嗎？", "有什麼建議")
     - MANAGE_BUDGET: 設定或查看預算 (例如 "設置預算", "查看預算", "我還剩多少預算？")
-    # (MODIFIED) 增加更多關鍵字
     - MANAGE_CATEGORIES: (新) 新增、刪除或查詢類別 (例如 "新增類別 寵物", "我的類別", "有哪些類別？", "類別", "目前類別")
     - NEW_FEATURE_EXCHANGE_RATE: 詢問金融功能，特別是匯率 (例如 "美金匯率", "100 USD = ? TWD")
-    - HELP: 請求幫助 (例如 "幫助", "你會幹嘛")
+    - HELP: 請求幫助 (例如 "幫助", "你會幹嘛", "說明", "help")
     - CHAT: 閒聊 (例如 "你好", "謝謝", "你是誰")
     - UNKNOWN: 無法分類
 
@@ -318,12 +321,15 @@ def get_user_intent(text, event_time):
     輸入: "美金匯率" -> {"intent": "NEW_FEATURE_EXCHANGE_RATE"}
     輸入: "月結" -> {"intent": "QUERY_REPORT"}
     輸入: "我還剩多少預算？" -> {"intent": "MANAGE_BUDGET"}
-    輸入: "新增類別 寵物" -> {"intent": "MANAGE_CATEGORIES"}
+    # (MODIFIED) 增加更多人性化範例
+    輸入: "我的餐飲預算 3000" -> {"intent": "MANAGE_BUDGET"}
+    輸入: "預算" -> {"intent": "MANAGE_BUDGET"}
+    輸入: "我想加個類別 叫 寵物" -> {"intent": "MANAGE_CATEGORIES"}
+    輸入: "我想刪掉 寵物 這個類別" -> {"intent": "MANAGE_CATEGORIES"}
     輸入: "我的類別" -> {"intent": "MANAGE_CATEGORIES"}
     輸入: "有哪些類別？" -> {"intent": "MANAGE_CATEGORIES"}
-    # (MODIFIED) 增加新範例
     輸入: "類別" -> {"intent": "MANAGE_CATEGORIES"}
-    輸入: "目前類別" -> {"intent": "MANAGE_CATEGORIES"}
+    輸入: "help" -> {"intent": "HELP"}
     """
     prompt = Template(prompt_raw).substitute(
         TEXT=text,
@@ -397,7 +403,8 @@ def handle_message(event):
     logger.debug(f"Received message: '{text}' from user '{user_id}' at {event_time}")
     
     # 1. 幫助指令 (優先)
-    if text == "幫助":
+    # (MODIFIED) 增加模糊比對 (說明, help) 且要求完全匹配
+    if re.search(r'^(幫助|說明|你會幹嘛|help)$', text, re.I): # re.I = 忽略大小寫
         # (MODIFIED) 動態產生預設類別列表
         default_cat_str = " ".join(f"• {c}" for c in DEFAULT_CATEGORIES)
         
@@ -420,9 +427,11 @@ def handle_message(event):
             "🗑️ **刪除**：\n"
             "   - 「刪除」：(安全) 移除您最近一筆記錄\n"
             "   - 「刪除 雞排」：預覽將刪除的記錄\n"
-            "   - 「確認刪除」：確認執行刪除（需先預覽）\n\n"
+            "   - 「確認刪除」：確認執行全部刪除\n"
+            "   - 「確認刪除 1」：(新) 確認刪除單筆\n\n"
             "💡 **預算**：\n"
-            "   - 「設置預算 餐飲 3000」\n"
+            "   - 「設定預算 餐飲 3000」\n"
+            "   - 「預算 餐飲 5000」 (可省略設定)\n"
             "   - 「查看預算」：檢查本月預算使用情況\n\n"
             "✨ **類別管理**：\n"
             f"   --- 預設類別 ---\n   {default_cat_str}\n\n"
@@ -471,7 +480,39 @@ def handle_message(event):
     try:
         if user_intent == "HELP":
             # (理論上在步驟 1 就被攔截了，但以防萬一)
-            reply_text = "您需要什麼幫助嗎？（...幫助訊息...）" 
+            # (MODIFIED) 再次呼叫幫助訊息
+            default_cat_str = " ".join(f"• {c}" for c in DEFAULT_CATEGORIES)
+            reply_text = (
+                f"📌 **記帳小浣熊使用說明🦝**：\n\n"
+                "💸 **自然記帳** (AI會幫你分析)：\n"
+                "   - 「今天中午吃了雞排80」\n"
+                "   - 「昨天喝飲料 50」\n"
+                "   - 「午餐100 晚餐200」\n\n"
+                "📊 **分析查詢** (推薦使用圖文選單)：\n"
+                "   - 「總收支分析」：分析所有時間\n"
+                "   - 「月結」：分析這個月\n"
+                "   - 「本週重點」：分析本週\n\n"
+                "🔎 **自然語言查詢**：\n"
+                "   - 「查詢 雞排」\n"
+                "   - 「查詢 這禮拜的餐飲」\n"
+                "   - 「查詢 上個月的收入」\n"
+                "   - 「我本月花太多嗎？」\n\n"
+                "🗑️ **刪除**：\n"
+                "   - 「刪除」：(安全) 移除您最近一筆記錄\n"
+                "   - 「刪除 雞排」：預覽將刪除的記錄\n"
+                "   - 「確認刪除」：確認執行全部刪除\n"
+                "   - 「確認刪除 1」：(新) 確認刪除單筆\n\n"
+                "💡 **預算**：\n"
+                "   - 「設定預算 餐飲 3000」\n"
+                "   - 「預算 餐飲 5000」 (可省略設定)\n"
+                "   - 「查看預算」：檢查本月預算使用情況\n\n"
+                "✨ **類別管理**：\n"
+                f"   --- 預設類別 ---\n   {default_cat_str}\n\n"
+                "   --- 自訂功能 ---\n"
+                "   - 「我的類別」：查看所有(含自訂)類別\n"
+                "   - 「新增類別 [名稱]」 (例如: 新增類別 寵物)\n"
+                "   - 「刪除類別 [名稱]」 (僅限自訂類別)"
+            )
 
         # --- 報表查詢 (QUERY_REPORT) ---
         elif user_intent == "QUERY_REPORT":
@@ -488,10 +529,14 @@ def handle_message(event):
         # --- 預算管理 (MANAGE_BUDGET) ---
         elif user_intent == "MANAGE_BUDGET":
             logger.debug("意圖：MANAGE_BUDGET (預算管理)")
-            if text.startswith("設置預算"):
+            # (MODIFIED) 增加模糊比對
+            # 1. 檢查是否包含 "設置" 或 "設定" 關鍵字
+            # 2. 檢查是否像 "預算 [某東西] [數字]" (例如 "預算 餐飲 3000")
+            if "設置" in text or "設定" in text or re.search(r'預算.*?\d+', text):
                 # (MODIFIED) 傳入 cat_sheet
                 reply_text = handle_set_budget(budget_sheet, cat_sheet, text, user_id)
             else: 
+                # 其他 (例如 "查看預算", "預算")
                 reply_text = handle_view_budget(trx_sheet, budget_sheet, user_id, event_time)
 
         # --- (NEW) 類別管理 (MANAGE_CATEGORIES) ---
@@ -500,6 +545,8 @@ def handle_message(event):
             if "新增" in text or "增加" in text:
                 reply_text = handle_add_category(cat_sheet, user_id, text)
             elif "刪除" in text or "移除" in text:
+                # (MODIFIED) 確保 "刪除類別" 不會被 "刪除" 指令攔截
+                # 這裡的 "刪除" 關鍵字比 "DELETE" 意圖中的 "刪除" 關鍵字更特定 (因為意圖是 MANAGE_CATEGORIES)
                 reply_text = handle_delete_category(cat_sheet, user_id, text)
             else: # "我的類別", "有哪些類別", "類別", "目前類別" etc.
                 reply_text = handle_list_categories(cat_sheet, user_id)
@@ -508,7 +555,8 @@ def handle_message(event):
         elif user_intent == "DELETE":
             logger.debug("意圖：DELETE (刪除)")
             if "確認刪除" in text or ("確認" in text and "刪除" in text):
-                reply_text = handle_confirm_delete(trx_sheet, user_id, event_time)
+                # (MODIFIED) 傳入 text 參數
+                reply_text = handle_confirm_delete(trx_sheet, user_id, event_time, text)
             elif text == "刪除": 
                 reply_text = handle_delete_last_record(trx_sheet, user_id)
             else:
@@ -1135,14 +1183,15 @@ def handle_delete_last_record(sheet, user_id):
         logger.error(f"刪除失敗：{e}", exc_info=True)
         return f"刪除記錄失敗：{str(e)}"
 
+# === (MODIFIED) 替換 handle_advanced_delete_nlp 函式 ===
 def handle_advanced_delete_nlp(sheet, user_id, full_text, event_time):
     """
-    預覽刪除功能：使用 NLP 解析 full_text (例如 "刪掉早上的草莓麵包")
+    (MODIFIED) 預覽刪除功能：使用 NLP 解析 full_text (例如 "刪掉早上的草莓麵包")
+    (支援序號顯示與快取)
     """
     logger.debug(f"處理 'NLP 預覽刪除'，user_id: {user_id}, text: {full_text}")
     
     try:
-        # 呼叫 call_search_nlp 來解析關鍵字和日期
         parsed_query = call_search_nlp(full_text, event_time)
         if parsed_query.get('status') == 'failure':
             return parsed_query.get('message', "🦝 刪除失敗，我不太懂您的意思。")
@@ -1150,7 +1199,6 @@ def handle_advanced_delete_nlp(sheet, user_id, full_text, event_time):
         keyword = parsed_query.get('keyword')
         start_date = parsed_query.get('start_date')
         end_date = parsed_query.get('end_date')
-        # (注意：刪除功能暫時不使用 type 欄位，它會刪除所有符合的記錄)
         
         if not keyword and not start_date and not end_date:
             logger.warning(f"NLP 無法從 '{full_text}' 解析出刪除條件。")
@@ -1191,8 +1239,8 @@ def handle_advanced_delete_nlp(sheet, user_id, full_text, event_time):
             logger.error(f"預覽刪除失敗：GSheet 標頭欄位名稱錯誤或缺失: {e}")
             return "刪除失敗：找不到必要的 GSheet 欄位。請檢查 GSheet 標頭是否正確。"
         
-        rows_to_delete = [] 
-        rows_info = []
+        # (MODIFIED) 儲存所有符合的記錄 (包含 GSheet 行號)
+        matches_found = [] 
         
         start_dt = datetime.strptime(start_date, '%Y-%m-%d').date() if start_date else None
         end_dt = datetime.strptime(end_date, '%Y-%m-%d').date() if end_date else None
@@ -1224,18 +1272,20 @@ def handle_advanced_delete_nlp(sheet, user_id, full_text, event_time):
                     date_match = False
             
             if keyword_match and date_match:
-                rows_to_delete.append(row_index + 1)
-                rows_info.append({
+                # (MODIFIED) 儲存 GSheet 行號 (1-based) 和資訊
+                info_dict = {
+                    'gsheet_row': row_index + 1, 
                     'date': record_datetime_str[:10] if record_datetime_str else 'N/A',
                     'category': row[idx_cat] if len(row) > idx_cat else 'N/A',
                     'amount': row[idx_amount] if len(row) > idx_amount else '0',
                     'notes': row[idx_note] if len(row) > idx_note else 'N/A'
-                })
+                }
+                matches_found.append(info_dict)
         
-        if not rows_to_delete:
+        if not matches_found:
             return f"🦝 嘿～找不到符合「{nlp_message}」的記錄呢～\n請確認一下條件是否有誤喔！"
         
-        total_count = len(rows_to_delete)
+        total_count = len(matches_found)
         
         warning_msg = ""
         if total_count > 30:
@@ -1245,27 +1295,42 @@ def handle_advanced_delete_nlp(sheet, user_id, full_text, event_time):
         preview_msg += f"📊 小浣熊找到 {total_count} 筆記錄囉～\n\n"
         
         display_count = min(5, total_count)
+        
+        # (NEW) 建立 cache 用的 mapping
+        cache_mapping = {}
+        all_gsheet_rows = [m['gsheet_row'] for m in matches_found]
+
         for i in range(display_count):
-            info = rows_info[i]
+            info = matches_found[i]
+            serial_num = i + 1 # 序號 (1, 2, 3...)
+            gsheet_row = info['gsheet_row']
+            
+            cache_mapping[serial_num] = gsheet_row # 儲存 {1: gsheet_row_10, 2: gsheet_row_15}
+            
             try:
                 amount_val = float(info['amount']) if info['amount'] else 0
-                preview_msg += f"  {i+1}. {info['date']} {info['notes']} ({info['category']}) {abs(amount_val):.0f} 元\n"
+                # (NEW) 在訊息中加入序號
+                preview_msg += f"  {serial_num}. {info['date']} {info['notes']} ({info['category']}) {abs(amount_val):.0f} 元\n"
             except (ValueError, TypeError):
-                preview_msg += f"  {i+1}. {info['date']} {info['notes']} ({info['category']})\n"
+                preview_msg += f"  {serial_num}. {info['date']} {info['notes']} ({info['category']})\n"
         
         if total_count > 5:
-            preview_msg += f"\n    ... (還有 {total_count - 5} 筆未顯示) ...\n"
+            preview_msg += f"\n    ... (還有 {total_count - 5} 筆未顯示，僅能操作前 {display_count} 筆) ...\n"
         
         preview_msg += warning_msg
-        preview_msg += f"\n\n💡 確認刪除請輸入：「確認刪除」🦝"
+        # (MODIFIED) 更新提示訊息
+        preview_msg += f"\n\n💡 請輸入：「確認刪除」 (刪除 *全部* {total_count} 筆)\n"
+        preview_msg += f"💡 或輸入：「確認刪除 [序號]」 (例如：確認刪除 1)"
         
+        # (MODIFIED) 儲存新的 cache 結構
         delete_preview_cache[user_id] = {
-            'rows': rows_to_delete,
             'timestamp': event_time,
-            'message': preview_msg
+            'message': preview_msg,
+            'mapping': cache_mapping,    # 存入序號對應 {1: 10, 2: 15}
+            'all_rows': all_gsheet_rows  # 存入所有 GSheet 行號 [10, 15]
         }
         
-        logger.info(f"預覽刪除：找到 {total_count} 筆記錄，已暫存至 cache")
+        logger.info(f"預覽刪除：找到 {total_count} 筆記錄，已暫存至 cache (含 mapping)")
         
         return preview_msg
         
@@ -1273,11 +1338,12 @@ def handle_advanced_delete_nlp(sheet, user_id, full_text, event_time):
         logger.error(f"預覽刪除失敗：{e}", exc_info=True)
         return f"預覽刪除失敗：{str(e)}"
 
-def handle_confirm_delete(sheet, user_id, event_time):
+# === (MODIFIED) 替換 handle_confirm_delete 函式 ===
+def handle_confirm_delete(sheet, user_id, event_time, text):
     """
-    確認刪除功能：模糊比對「確認刪除」
+    (MODIFIED) 確認刪除功能：支援「確認刪除」 (全部) 或 「確認刪除 [序號]」 (單筆)
     """
-    logger.debug(f"處理 '確認刪除' 指令，user_id: {user_id}")
+    logger.debug(f"處理 '確認刪除' 指令，user_id: {user_id}, text: {text}")
     
     if user_id not in delete_preview_cache:
         return "🦝 嘿～您還沒有預覽任何記錄呢！\n請先使用「刪除」指令查看要刪除的內容喔～"
@@ -1290,15 +1356,46 @@ def handle_confirm_delete(sheet, user_id, event_time):
         del delete_preview_cache[user_id]
         return "⏰ 哎呀！您的預覽已經過期囉（超過 5 分鐘）\n請重新使用「刪除」指令預覽～～ 🦝"
     
-    rows_to_delete = cache_data['rows']
+    # (NEW) 判斷是「全部刪除」還是「刪除單筆」
+    rows_to_delete_gsheet_indices = []
+    delete_message_suffix = ""
+
+    # (NEW) 嘗試匹配「確認刪除 1」或「刪除 1」 (允許空格或沒空格)
+    match = re.search(r'(確認刪除|刪除)\s*(\d+)', text)
     
-    if not rows_to_delete:
+    if match:
+        try:
+            serial_num = int(match.group(2))
+            mapping = cache_data.get('mapping', {})
+            
+            if serial_num in mapping:
+                gsheet_row = mapping[serial_num]
+                rows_to_delete_gsheet_indices = [gsheet_row]
+                delete_message_suffix = f" 1 筆記錄 (序號 {serial_num})"
+                logger.debug(f"確認刪除：偵測到單筆刪除，序號 {serial_num}，GSheet 行號 {gsheet_row}")
+            else:
+                return f"🦝 咦？我找不到「序號 {serial_num}」喔～\n請檢查您預覽中的序號 (最多只支援到 5 喔！)"
+        except ValueError:
+            # 應該不會發生，但以防萬一
+            rows_to_delete_gsheet_indices = cache_data.get('all_rows', [])
+            delete_message_suffix = f" {len(rows_to_delete_gsheet_indices)} 筆記錄 (全部)"
+            logger.debug(f"確認刪除：解析序號失敗，退回全部刪除")
+    
+    else:
+        # (舊邏輯) 刪除全部
+        rows_to_delete_gsheet_indices = cache_data.get('all_rows', [])
+        delete_message_suffix = f" {len(rows_to_delete_gsheet_indices)} 筆記錄 (全部)"
+        logger.debug(f"確認刪除：偵測到全部刪除，共 {len(rows_to_delete_gsheet_indices)} 筆")
+
+    
+    if not rows_to_delete_gsheet_indices:
         del delete_preview_cache[user_id]
         return "🦝 嗯...暫存中沒有記錄可以刪除耶～"
     
     try:
         deleted_count = 0
-        for row_num in sorted(rows_to_delete, reverse=True):
+        # (MODIFIED) 使用新的 gsheet indices 列表
+        for row_num in sorted(rows_to_delete_gsheet_indices, reverse=True):
             try:
                 sheet.delete_rows(row_num)
                 deleted_count += 1
@@ -1307,7 +1404,8 @@ def handle_confirm_delete(sheet, user_id, event_time):
         
         del delete_preview_cache[user_id]
         logger.info(f"確認刪除成功：共刪除 {deleted_count} 筆記錄")
-        return f"✅ **刪除完成！** ✨\n\n小浣熊已經幫您刪除了 {deleted_count} 筆記錄囉～ 🦝"
+        # (MODIFIED) 回傳動態訊息
+        return f"✅ **刪除完成！** ✨\n\n小浣熊已經幫您刪除了{delete_message_suffix}喔～ 🦝"
         
     except Exception as e:
         logger.error(f"確認刪除失敗：{e}", exc_info=True)
@@ -1317,16 +1415,17 @@ def handle_confirm_delete(sheet, user_id, event_time):
 
 def handle_set_budget(sheet, cat_sheet, text, user_id):
     """
-    (MODIFIED) 處理 '設置預算' 指令 (使用動態類別)
+    (MODIFIED) 處理 '設置預算' 指令 (使用動態類別 + re.search 模糊比對)
     """
     logger.debug(f"處理 '設置預算' 指令，user_id: {user_id}, text: {text}")
-    # (MODIFIED) 允許類別名稱包含英文和數字
-    match = re.match(r'設置預算\s+([\u4e00-\u9fa5a-zA-Z0-9]+)\s+(\d+)', text)
+    # (MODIFIED) 1. 使用 re.search
+    # (MODIFIED) 2. 允許 "設置預算", "設定預算", "預算"
+    match = re.search(r'(設置預算|設定預算|預算)\s+([\u4e00-\u9fa5a-zA-Z0-9]+)\s+(\d+)', text)
     if not match:
-        return "格式錯誤！請輸入「設置預算 [類別] [限額]」，例如：「設置預算 餐飲 3000」"
+        return "格式錯誤！請包含「(設置/設定)預算 [類別] [限額]」\n例如：「設定預算 餐飲 3000」\n或：「預算 餐飲 3000」"
     
-    category = match.group(1).strip()
-    limit = int(match.group(2)) 
+    category = match.group(2).strip()
+    limit = int(match.group(3)) 
     
     # (MODIFIED) 獲取使用者的動態類別列表
     valid_categories = get_user_categories(cat_sheet, user_id)
@@ -1740,7 +1839,7 @@ def call_search_nlp(query_text, event_time):
         logger.error(f"Gemini Search JSON 解析失敗: {clean_response}")
         return {"status": "failure", "message": f"AI 分析器 JSON 解析失敗: {e}"}
     except Exception as e:
-        logger.error(f"Gemini Search API 呼叫失敗: {e}", exc_info=True)
+        logger.error(f"Gemini Search API 呼叫失敗：{e}", exc_info=True)
         return {"status": "failure", "message": f"AI 分析器 API 呼叫失敗: {e}"}
 
 # === (NEW) `handle_update_record_nlp` (佔位) ===
