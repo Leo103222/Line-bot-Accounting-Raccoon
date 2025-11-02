@@ -281,6 +281,7 @@ def handle_delete_category(cat_sheet, user_id, text):
         return f"刪除類別時發生錯誤：{str(e)}"
 
 # === (MODIFIED) 意圖分類器 (強化模糊比對) ===
+# *** (UPDATED 11-02) ***
 def get_user_intent(text, event_time):
     """
     使用 Gemini 判斷使用者的 "主要意圖"
@@ -330,6 +331,9 @@ def get_user_intent(text, event_time):
     輸入: "有哪些類別？" -> {"intent": "MANAGE_CATEGORIES"}
     輸入: "類別" -> {"intent": "MANAGE_CATEGORIES"}
     輸入: "help" -> {"intent": "HELP"}
+    # === (NEW) (修改點) 解決 Bug 6 & 7 (閒聊判斷) ===
+    輸入: "我今天晚餐吃了烤肉沒花錢快樂" -> {"intent": "CHAT"}
+    輸入: "朋友請我吃火鍋" -> {"intent": "CHAT"}
     """
     prompt = Template(prompt_raw).substitute(
         TEXT=text,
@@ -392,6 +396,7 @@ def webhook():
     return 'OK'
 
 # === (REWRITE) `handle_message` (主路由器) ===
+# *** (UPDATED 11-02) ***
 @handler.add(MessageEvent, message=TextMessage)
 def handle_message(event):
     text = event.message.text.strip()
@@ -471,6 +476,10 @@ def handle_message(event):
         except LineBotApiError as e:
             logger.error(f"回覆工作表錯誤訊息失敗：{e}", exc_info=True)
         return
+    
+    # === (NEW) 步驟 2.1：(修改點) 提早獲取 user_name ===
+    # 移到這裡，讓所有意圖都能使用
+    user_name = get_user_profile_name(user_id) 
             
     # === 3. (新) AI 意圖分類器 ===
     user_intent = get_user_intent(text, event_time)
@@ -570,7 +579,8 @@ def handle_message(event):
         # --- 詢問建議 (QUERY_ADVICE) ---
         elif user_intent == "QUERY_ADVICE":
             logger.debug("意圖：QUERY_ADVICE (詢問建議)")
-            reply_text = handle_conversational_query_advice(trx_sheet, budget_sheet, text, user_id, event_time)
+            # (修改點) 傳入 user_name
+            reply_text = handle_conversational_query_advice(trx_sheet, budget_sheet, text, user_id, user_name, event_time)
         
         # --- 修改 (UPDATE) ---
         elif user_intent == "UPDATE":
@@ -585,8 +595,7 @@ def handle_message(event):
         # --- 記帳 (RECORD) ---
         elif user_intent == "RECORD":
             logger.debug("意圖：RECORD (記帳)")
-            user_name = get_user_profile_name(user_id)
-            # (MODIFIED) 傳入 cat_sheet
+            # (修改點) user_name 已經在上面獲取了
             reply_text = handle_nlp_record(trx_sheet, budget_sheet, cat_sheet, text, user_id, user_name, event_time)
         
         # --- 聊天 (CHAT) ---
@@ -596,8 +605,7 @@ def handle_message(event):
         
         else: # UNKNOWN 
             logger.warning(f"未知的意圖 '{user_intent}'，當作聊天或記帳處理。")
-            # (MODIFIED) 傳入 cat_sheet
-            user_name = get_user_profile_name(user_id)
+            # (修改點) user_name 已經在上面獲取了
             reply_text = handle_nlp_record(trx_sheet, budget_sheet, cat_sheet, text, user_id, user_name, event_time)
 
     except Exception as e:
@@ -743,6 +751,7 @@ def _try_collapse_add_expr_from_text(original_text: str, records: list):
     return collapsed, True
 
 # === (MODIFIED) `handle_nlp_record` (記帳) (動態類別 + Bug 修正) ===
+# *** (UPDATED 11-02) ***
 def handle_nlp_record(sheet, budget_sheet, cat_sheet, text, user_id, user_name, event_time):
     """
     (MODIFIED) 使用 Gemini NLP 處理自然語言記帳 (記帳、聊天、查詢、系統問題)
@@ -799,7 +808,7 @@ def handle_nlp_record(sheet, budget_sheet, cat_sheet, text, user_id, user_name, 
     解析規則：
     1. status "success": 如果成功解析為記帳 (包含一筆或多筆)。
        - data: 必須是一個 "列表" (List)，包含一或多個記帳物件。
-       - **多筆記帳**: 如果使用者一次輸入多筆 (例如 "午餐100 晚餐200")，"data" 列表中必須包含 *多個* 物件。
+       - **多筆記帳**: 如果使用者一次輸入多筆 (例如 "午餐100 晚餐200", "杏仁茶30+茶葉蛋10")，"data" 列表中必須包含 *多個* 物件。
        - **時間規則 (非常重要！請嚴格遵守！)**:
            - **(規則 1) 顯式時間 (最高優先)**: 如果使用者 "明確" 提到 "日期" (例如 "昨天", "10/25") 或 "時間" (例如 "16:22", "晚上7點")，**必須** 優先解析並使用該時間。
            - **(規則 2) 預設為傳送時間 (次高優先)**: 如果 "規則 1" 不適用 (即使用者 "沒有" 提到明確日期或時間，例如輸入 "雞排 80", "零食 50")，**必須** 使用使用者的「傳送時間」，即 **$CURRENT_TIME**。
@@ -816,12 +825,16 @@ def handle_nlp_record(sheet, budget_sheet, cat_sheet, text, user_id, user_name, 
        - message: "記錄成功" (此欄位在 success 時不重要)
 
     2. status "chat": 如果使用者只是在閒聊 (例如 "你好", "你是誰", "謝謝")。
+       # === (NEW) (修改點) 解決 Bug 6 & 7 ===
+       - **(新規則 2.1)** 如果使用者提到「請客」、「沒花錢」，或只是分享事件*而沒有明確金額*，這*不是*記帳，應視為 "chat"。
     3. status "query": 如果使用者在 "詢問" 關於他帳務的問題 (例如 "我本月花太多嗎？")。
     4. status "system_query": 如果使用者在詢問 "系統功能" 或 "有哪些類別"。
     5. status "failure": 如果看起來像記帳，但缺少關鍵資訊 (例如 "雞排" (沒說金額))。
+       # === (NEW) (修改點) 解決 Bug 6 & 7 ===
+       - **(新規則 5.1) 嚴格禁止**在沒有明确金額時*猜測*一個數字 (例如 100) 就把它視為聊天就好。
 
     ⚠️ 規則補充：
-    - (運算子規則) 如果使用者輸入金額中有「+」或「x/＊」符號（例如 "晚餐180+60+135"、"飲料59x2"），請將它們視為「單一筆記帳」的運算表達式，**計算總和**後輸出一筆金額，而不是拆成多筆。
+    # (修改點) 移除了錯誤的「運算子規則」
     - **(新！收入判斷)**: 如果使用者明確提到 "贏"、"賺"、"撿到"、"收到" (例如 "打牌 贏30", "賺 500")，*無論*上下文是什麼，都*必須* 歸類為 `"category": "收入"` 且 `amount` 為*正數* (+)。
 
     範例：
@@ -836,11 +849,17 @@ def handle_nlp_record(sheet, budget_sheet, cat_sheet, text, user_id, user_name, 
 
     輸入: "目前收入 39020 支出 45229" (規則 2) -> {"status": "success", "data": [{"datetime": "$CURRENT_TIME", "category": "收入", "amount": 39020, "notes": "目前收入"}, {"datetime": "$CURRENT_TIME", "category": "雜項", "amount": -45229, "notes": "支出"}], "message": "記錄成功"}
     輸入: "午餐100 晚餐200" (規則 3) -> {"status": "success", "data": [{"datetime": "$TODAY 12:00:00", "category": "餐飲", "amount": -100, "notes": "午餐"}, {"datetime": "$TODAY 18:00:00", "category": "餐飲", "amount": -200, "notes": "晚餐"}], "message": "記錄成功"}
+    # === (NEW) (修改點) 解決 Bug 5, 6, 7 ===
+    輸入: "早餐 杏仁茶30 + 茶葉蛋10" (多筆 & 類別)
+    輸出: {"status": "success", "data": [{"datetime": "$TODAY 08:00:00", "category": "飲料", "amount": -30, "notes": "早餐 杏仁茶"}, {"datetime": "$TODAY 08:00:00", "category": "餐飲", "amount": -10, "notes": "早餐 茶葉蛋"}], "message": "記錄成功"}
+    
+    輸入: "我今天晚餐吃了烤肉沒花錢" (規則 2.1) -> {"status": "chat", "data": null, "message": "哇！真幸運！🦝"}
+    輸入: "朋友請我吃火鍋" (規則 2.1) -> {"status": "chat", "data": null, "message": "真好～有人請客！"}
 
     輸入: "你好" -> {"status": "chat", "data": null, "message": "哈囉！我是記帳小浣熊🦝 需要幫忙記帳嗎？還是想聊聊天呀？"}
     輸入: "我本月花太多嗎？" -> {"status": "query", "data": null, "message": "我本月花太多嗎？"}
     輸入: "目前有什麼項目?" -> {"status": "system_query", "data": null, "message": "請問您是指「我的類別」嗎？ 🦝 您可以輸入「我的類別」來查看喔！"}
-    輸入: "宵夜" -> {"status": "failure", "data": null, "message": "🦝？ 宵夜吃了什麼？花了多少錢呢？"}
+    輸入: "宵夜" (規則 5) -> {"status": "failure", "data": null, "message": "🦝？ 宵夜吃了什麼？花了多少錢呢？"}
     """
     prompt = Template(prompt_raw).substitute(
         CURRENT_TIME=current_time_str,
@@ -865,6 +884,8 @@ def handle_nlp_record(sheet, budget_sheet, cat_sheet, text, user_id, user_name, 
             records = data.get('data', [])
 
             try:
+                # (註解) 這裡的 _try_collapse_add_expr_from_text 是一個保險機制
+                # 它只會合併 "晚餐180+60+135" (數字結尾) 這種，不會影響 "杏仁茶30+茶葉蛋10"
                 records, _did = _try_collapse_add_expr_from_text(text, records)
             except Exception as _e:
                 logger.warning(f"合併加法表達式失敗：{_e}")
@@ -915,26 +936,36 @@ def handle_nlp_record(sheet, budget_sheet, cat_sheet, text, user_id, user_name, 
             cute_reply = get_cute_reply(last_category)
             warning_message = check_budget_warning(sheet, budget_sheet, user_id, last_category, event_time)
             
+            # === (NEW) (修改點) 解決 Bug 1 (月結餘額) ===
+            # (修改點) 只計算「本月」餘額
+            current_month_str = event_time.strftime('%Y-%m')
             all_records = sheet.get_all_records()
-            user_balance = 0.0
+            user_monthly_balance = 0.0 # 改名為 monthly
+            
             for r in all_records:
                 if r.get('使用者ID') == user_id:
-                    try:
-                        user_balance += float(r.get('金額', 0))
-                    except (ValueError, TypeError):
-                        continue
+                    # (修改點) 檢查是否為本月
+                    record_time_str = get_datetime_from_record(r)
+                    if record_time_str.startswith(current_month_str):
+                        try:
+                            user_monthly_balance += float(r.get('金額', 0))
+                        except (ValueError, TypeError):
+                            continue
             
             summary_text = "\n".join(reply_summary_lines)
+            
+            # (修改點) 修改回傳的文字
             return (
                 f"{cute_reply}\n\n"
                 f"📝 **摘要 (共 {len(reply_summary_lines)} 筆)**：\n"
                 f"{summary_text}\n\n"
-                f"📈 {user_name} 目前總餘額：{user_balance:.0f} 元"
+                f"📈 {user_name} 本月淨餘額：{user_monthly_balance:.0f} 元" 
                 f"{warning_message}"
             )
 
         elif status == 'chat':
-            return handle_chat_nlp(text)
+            # (修改點) 讓閒聊的回應更生動
+            return handle_chat_nlp(text) 
         
         elif status == 'system_query':
             # 現在 "有哪些類別" 應該會被 MANAGE_CATEGORIES 攔截
@@ -943,7 +974,8 @@ def handle_nlp_record(sheet, budget_sheet, cat_sheet, text, user_id, user_name, 
         
         elif status == 'query':
             logger.debug(f"NLP 偵測到聊天式查詢 '{text}'，轉交至 handle_conversational_query_advice")
-            return handle_conversational_query_advice(sheet, budget_sheet, text, user_id, event_time)
+            # (修改點) 傳入 user_name
+            return handle_conversational_query_advice(sheet, budget_sheet, text, user_id, user_name, event_time)
         
         else: # status == 'failure'
             return message or "🦝？ 抱歉，我聽不懂..."
@@ -1533,7 +1565,9 @@ def handle_view_budget(trx_sheet, budget_sheet, user_id, event_time):
         logger.error(f"查看預算失敗：{e}", exc_info=True)
         return f"查看預算失敗：{str(e)}"
 
-def handle_conversational_query_advice(trx_sheet, budget_sheet, text, user_id, event_time):
+# *** (UPDATED 11-02) ***
+# (修改點) 增加 user_name 參數
+def handle_conversational_query_advice(trx_sheet, budget_sheet, text, user_id, user_name, event_time):
     """
     (新功能) 處理 "詢問建議" (例如 "我花太多嗎", "有什麼建議")
     """
@@ -1558,7 +1592,7 @@ def handle_conversational_query_advice(trx_sheet, budget_sheet, text, user_id, e
         
         # === (新) AI 分析 Prompt ===
         analysis_data = f"""
-        - 使用者：{user_id}
+        - 使用者名稱：{user_name}
         - 詢問："{text}"
         - 本月 ({this_month_date.month}月) 目前支出：{this_month_total:.0f} 元
         - 上月 ({last_month_end_date.month}月) 總支出：{last_month_total:.0f} 元
@@ -1574,13 +1608,21 @@ def handle_conversational_query_advice(trx_sheet, budget_sheet, text, user_id, e
         $ANALYSIS_DATA
 
         請直接回覆分析結果 (不要說 "根據數據...")，口氣要像小浣熊：
+
+        # === (NEW) (修改點) 解決 Bug 2 & 3 ===
+        - (稱呼規則) 請用「{user_name}」來稱呼使用者，例如「哈囉～{user_name}！」，而不是用 ID。
+        - (預算規則) 如果「本月總預算」為 0 元，請*不要*說「超出預期」，而應該說「您本月尚未設定總預算喔！」
         
         - 優先比較「本月支出」和「上月支出」，給出結論 (例如 "花費增加/減少了 X%")。
-        - 接著比較「本月支出」和「本月總預算」，判斷是否在控制內。
+        - 接著比較「本月支出」和「本月總預算」，判斷是否在控制內 (請遵守 預算規則)。
         - 最後，從「本月支出細項」中找出花費*最多*的類別，並給予*具體*的建議。
         - 保持簡潔有力。
         """
-        prompt = Template(prompt_raw).substitute(ANALYSIS_DATA=analysis_data)
+        # (修改點) 傳入 user_name
+        prompt = Template(prompt_raw).substitute(
+            ANALYSIS_DATA=analysis_data,
+            user_name=user_name 
+        )
         
         response = gemini_model.generate_content(prompt)
         clean_response = response.text.strip().replace("```json", "").replace("```", "")
