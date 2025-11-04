@@ -1609,6 +1609,8 @@ def handle_view_budget(trx_sheet, budget_sheet, user_id, event_time):
 
 # *** (UPDATED 11-02) ***
 # (修改點) 增加 user_name 參數
+# *** (UPDATED 11-02) ***
+# (修改點) 增加 user_name 參數
 def handle_conversational_query_advice(trx_sheet, budget_sheet, text, user_id, user_name, event_time):
     """
     (新功能) 處理 "詢問建議" (例如 "我花太多嗎", "有什麼建議")
@@ -1616,18 +1618,29 @@ def handle_conversational_query_advice(trx_sheet, budget_sheet, text, user_id, u
     logger.debug(f"處理 '聊天式建議'，user_id: {user_id}, text: {text}")
 
     try:
+        # === (NEW) 步驟 0: 效能優化 (主要修復點) ===
+        # 1. 一次性讀取所有 GSheet 記錄 (從 Transactions)
+        logger.debug("Optimizing: 正在讀取所有交易紀錄 (僅一次)...")
+        all_records = trx_sheet.get_all_records()
+        
+        # 2. 在 Python 中過濾出這位使用者的所有記錄
+        logger.debug(f"Optimizing: 正在過濾使用者 {user_id} 的記錄...")
+        user_all_records = [r for r in all_records if r.get('使用者ID') == user_id]
+        logger.debug(f"Optimizing: 找到 {len(user_all_records)} 筆記錄。")
+        # ==========================================
+
         # 1. 取得本月資料 (使用你的輔助函式)
         this_month_date = event_time.date()
-        this_month_data = get_spending_data_for_month(trx_sheet, user_id, this_month_date.year, this_month_date.month)
+        # (MODIFIED) 傳入 user_all_records 列表
+        this_month_data = get_spending_data_for_month(user_all_records, this_month_date.year, this_month_date.month)
         
         # 2. 取得上月資料
         last_month_end_date = this_month_date.replace(day=1) - timedelta(days=1)
-        last_month_data = get_spending_data_for_month(trx_sheet, user_id, last_month_end_date.year, last_month_end_date.month)
-
+        # (MODIFIED) 傳入 user_all_records 列表 (重複使用)
+        last_month_data = get_spending_data_for_month(user_all_records, last_month_end_date.year, last_month_end_date.month)
         this_month_total = this_month_data['total']
         last_month_total = last_month_data['total']
-
-        # 3. 取得預算資料 (檢查是否超支)
+        # 3. 取得預算資料 (這個 OK，budget_sheet 通常很小)
         budgets_records = budget_sheet.get_all_records()
         user_budgets = [b for b in budgets_records if b.get('使用者ID') == user_id]
         total_limit = sum(float(b.get('限額', 0)) for b in user_budgets)
@@ -1666,6 +1679,9 @@ def handle_conversational_query_advice(trx_sheet, budget_sheet, text, user_id, u
             user_name=user_name 
         )
         
+        # (MODIFIED) 
+        # 經過優化後，現在執行到這裡會快很多
+        # 程式有足夠的時間等待 Gemini 回應
         response = gemini_model.generate_content(prompt)
         clean_response = response.text.strip().replace("```json", "").replace("```", "")
         
@@ -1675,22 +1691,31 @@ def handle_conversational_query_advice(trx_sheet, budget_sheet, text, user_id, u
         logger.error(f"聊天式建議失敗：{e}", exc_info=True)
         return f"糟糕！小浣熊分析時打結了：{str(e)}"
 
-def get_spending_data_for_month(sheet, user_id, year, month):
+# === (MODIFIED) 
+# 1. 移除 sheet, user_id 參數
+# 2. 改為接收 user_records_list (一個 Python list)
+def get_spending_data_for_month(user_records_list, year, month):
     """
-    獲取特定年/月，某使用者的總支出和分類支出
+    (MODIFIED) 獲取特定年/月，某使用者的總支出和分類支出 (從傳入的 list)
     """
-    logger.debug(f"輔助函式：抓取 {user_id} 在 {year}-{month} 的資料")
+    # 3. 更新 log
+    logger.debug(f"輔助函式：分析 {year}-{month} 的資料 (從 {len(user_records_list)} 筆記錄中)")
     month_str = f"{year}-{month:02d}"
     
     total_expense = 0.0
     category_spending = {}
     
-    records = sheet.get_all_records()
-    
-    for r in records:
+    # 4. (REMOVED) 移除慢速的 GSheet 讀取
+    # records = sheet.get_all_records() 
+
+    # 5. (MODIFIED) 
+    for r in user_records_list:
         record_time_str = get_datetime_from_record(r)
-        if (r.get('使用者ID') == user_id and 
-            record_time_str.startswith(month_str)):
+        
+        # 6. (MODIFIED) 
+        #    因為傳入的 list 已經是這個 user_id 的了，
+        #    所以 *不再需要* 檢查 r.get('使用者ID') == user_id
+        if record_time_str.startswith(month_str):
             
             try:
                 amount = float(r.get('金額', 0))
