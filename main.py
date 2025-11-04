@@ -753,6 +753,8 @@ def _try_collapse_add_expr_from_text(original_text: str, records: list):
 
 # === (MODIFIED) `handle_nlp_record` (記帳) (動態類別 + Bug 修正) ===
 # *** (UPDATED 11-04) ***
+# === (MODIFIED) `handle_nlp_record` (記帳) (動態類別 + Bug 修正) ===
+# *** (UPDATED 11-05) ***
 def handle_nlp_record(sheet, budget_sheet, cat_sheet, text, user_id, user_name, event_time):
     """
     (MODIFIED) 使用 Gemini NLP 處理自然語言記帳 (記帳、聊天、查詢、系統問題)
@@ -828,12 +830,16 @@ def handle_nlp_record(sheet, budget_sheet, cat_sheet, text, user_id, user_name, 
     2. status "chat": 如果使用者只是在閒聊 (例如 "你好", "你是誰", "謝謝")。
        # === (NEW) (修改點) 解決 Bug 6 & 7 ===
        - **(新規則 2.1)** 如果使用者提到「請客」、「沒花錢」，或只是分享事件*而沒有明確金額*，這*不是*記帳，應視為 "chat"。
-       - **(新規則 2.2) 拒絕無意義輸入**: 如果使用者的輸入完全沒有可識別的「項目名稱」或「金額數字」 (例如 "...", "??", "aaa")，這*不是*記帳，應視為 "chat"。
+       # (*** MODIFIED 11-05 ***) (規則 2.2 已被移至 規則 5.2)
+
     3. status "query": 如果使用者在 "詢問" 關於他帳務的問題 (例如 "我本月花太多嗎？")。
     4. status "system_query": 如果使用者在詢問 "系統功能" 或 "有哪些類別"。
+    
     5. status "failure": 如果看起來像記帳，但缺少關鍵資訊 (例如 "雞排" (沒說金額))。
        # === (NEW) (修改點) 解決 Bug 6 & 7 ===
        - **(新規則 5.1) 嚴格禁止**在沒有明确金額時*猜測*一個數字 (例如 100) 就把它視為聊天就好。
+       # === (*** NEW 11-05 ***) 解決幻覺 Bug ===
+       - **(新規則 5.2) 無意義輸入**: 如果使用者的輸入*完全*由標點符號、亂碼或單一表情符號組成 (例如 "...", "???", "////", "：：：", "😅")，這*不是*記帳，應視為 "failure"。
 
     ⚠️ 規則補充：
     # (修改點) 移除了錯誤的「運算子規則」
@@ -866,9 +872,11 @@ def handle_nlp_record(sheet, budget_sheet, cat_sheet, text, user_id, user_name, 
     輸入: "我今天晚餐吃了烤肉沒花錢" (規則 2.1) -> {"status": "chat", "data": null, "message": "哇！真幸運！🦝"}
     輸入: "朋友請我吃火鍋" (規則 2.1) -> {"status": "chat", "data": null, "message": "真好～有人請客！"}
     
-    # (針對使用者回報的案例 - AI 幻覺)
-    輸入: "..." (規則 2.2) -> {"status": "chat", "data": null, "message": "🦝？"}
-    輸入: "???" (規則 2.2) -> {"status": "chat", "data": null, "message": "🦝？"}
+    # (針對使用者回報的案例 - AI 幻覺) (*** MODIFIED 11-05 ***)
+    輸入: "..." (規則 5.2) -> {"status": "failure", "data": null, "message": "🦝？ 請問需要我做什麼嗎？"}
+    輸入: "????" (規則 5.2) -> {"status": "failure", "data": null, "message": "🦝？"}
+    輸入: "////" (規則 5.2) -> {"status": "failure", "data": null, "message": "🦝？"}
+    輸入: "：：：" (規則 5.2) -> {"status": "failure", "data": null, "message": "🦝？"}
 
     輸入: "你好" -> {"status": "chat", "data": null, "message": "哈囉！我是記帳小浣熊🦝 需要幫忙記帳嗎？還是想聊聊天呀？"}
     輸入: "我本月花太多嗎？" -> {"status": "query", "data": null, "message": "我本月花太多嗎？"}
@@ -968,12 +976,12 @@ def handle_nlp_record(sheet, budget_sheet, cat_sheet, text, user_id, user_name, 
             
             summary_text = "\n".join(reply_summary_lines)
             
-            # (修改點) 修改回傳的文字
+            # (*** MODIFIED 11-05 ***) 移除了 {user_name}
             return (
                 f"{cute_reply}\n\n"
                 f"📝 **摘要 (共 {len(reply_summary_lines)} 筆)**：\n"
                 f"{summary_text}\n\n"
-                f"📈 {user_name} 本月淨餘額：{user_monthly_balance:.0f} 元" 
+                f"📈 本月淨餘額：{user_monthly_balance:.0f} 元" 
                 f"{warning_message}"
             )
 
@@ -995,6 +1003,7 @@ def handle_nlp_record(sheet, budget_sheet, cat_sheet, text, user_id, user_name, 
             return handle_conversational_query_advice(sheet, budget_sheet, text, user_id, user_name, event_time)
         
         else: # status == 'failure'
+             # (*** MODIFIED 11-05 ***) 確保 failure 時有預設訊息
             return message or "🦝？ 抱歉，我聽不懂..."
 
     except json.JSONDecodeError as e:
@@ -1003,7 +1012,7 @@ def handle_nlp_record(sheet, budget_sheet, cat_sheet, text, user_id, user_name, 
     except Exception as e:
         logger.error(f"Gemini API 呼叫或 GSheet 寫入失敗：{e}", exc_info=True)
         return f"目前我無法處理這個請求：{str(e)}"
-
+    
 # === *** (DELETED) `handle_check_balance` 已被刪除 *** ===
 # (因為 handle_total_analysis 更好)
 
