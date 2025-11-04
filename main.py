@@ -282,6 +282,8 @@ def handle_delete_category(cat_sheet, user_id, text):
 
 # === (MODIFIED) 意圖分類器 (強化模糊比對) ===
 # *** (UPDATED 11-02) ***
+# === (MODIFIED) 意圖分類器 (強化模糊比對) ===
+# *** (UPDATED 11-05 v4) ***
 def get_user_intent(text, event_time):
     """
     使用 Gemini 判斷使用者的 "主要意圖"
@@ -322,7 +324,6 @@ def get_user_intent(text, event_time):
     輸入: "美金匯率" -> {"intent": "NEW_FEATURE_EXCHANGE_RATE"}
     輸入: "月結" -> {"intent": "QUERY_REPORT"}
     輸入: "我還剩多少預算？" -> {"intent": "MANAGE_BUDGET"}
-    # (MODIFIED) 增加更多人性化範例
     輸入: "我的餐飲預算 3000" -> {"intent": "MANAGE_BUDGET"}
     輸入: "預算" -> {"intent": "MANAGE_BUDGET"}
     輸入: "我想加個類別 叫 寵物" -> {"intent": "MANAGE_CATEGORIES"}
@@ -334,6 +335,16 @@ def get_user_intent(text, event_time):
     # === (NEW) (修改點) 解決 Bug 6 & 7 (閒聊判斷) ===
     輸入: "我今天晚餐吃了烤肉沒花錢快樂" -> {"intent": "CHAT"}
     輸入: "朋友請我吃火鍋" -> {"intent": "CHAT"}
+    
+    # === (*** NEW 11-05 v4 ***) 解決無意義輸入的幻覺 Bug ===
+    # 告訴 AI 這些都是閒聊或無法處理
+    輸入: "..." -> {"intent": "CHAT"}
+    輸入: "…" -> {"intent": "CHAT"}
+    輸入: "？？？" -> {"intent": "CHAT"}
+    輸入: "：" -> {"intent": "CHAT"}
+    輸入: "///" -> {"intent": "CHAT"}
+    # 或是完全無法辨識的
+    輸入: "asdfg" -> {"intent": "UNKNOWN"}
     """
     prompt = Template(prompt_raw).substitute(
         TEXT=text,
