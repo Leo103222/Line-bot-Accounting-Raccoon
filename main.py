@@ -238,12 +238,13 @@ def handle_search_records_nlp(sheet, user_id, full_text, event_time):
         return f"🦝 找不到關於「{nlp_message}」的任何記錄喔 (帳本是空的)！"
         
     # 常見欄位索引（若不存在給 -1，讓後續以條件判斷）
-    idx_time_new = header_map.get('日期', -1)
-    idx_time_old = header_map.get('時間', -1)
+    idx_time_new = header.index('日期') if '日期' in header else -1
+    idx_time_old = header.index('時間') if '時間' in header else -1
+
     try:
         idx_uid = header.index('使用者ID')
-        idx_time_new = header_map.get('日期', -1)
-        idx_time_old = header_map.get('時間', -1)
+        idx_time_new = header.index('日期') if '日期' in header else -1
+        idx_time_old = header.index('時間') if '時間' in header else -1
         idx_amount = header.index('金額')
         idx_cat = header.index('類別')
         idx_note = header.index('備註')
