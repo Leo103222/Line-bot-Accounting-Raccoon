@@ -1,3 +1,4 @@
+#小浣熊v3.6 優化查詢
 import os
 import logging
 import re
