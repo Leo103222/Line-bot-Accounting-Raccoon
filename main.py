@@ -14,7 +14,6 @@ from datetime import datetime, timedelta, date
 from dotenv import load_dotenv
 from zoneinfo import ZoneInfo
 from string import Template
-import math # 用於本地解析
 
 # === 時區設定（可用環境變數 APP_TZ 覆蓋，預設 Asia/Taipei） ===
 APP_TZ = os.getenv('APP_TZ', 'Asia/Taipei')
@@ -201,6 +200,150 @@ def handle_list_categories(cat_sheet, user_id):
     
     reply += "💡 您可以使用「新增類別 [名稱]」來增加喔！\n💡 「刪除類別 [名稱]」可移除自訂類別。"
     return reply
+# === *** (MODIFIED) 步驟三-B: 升級 `handle_search_records_nlp` (修復 Bug #3) *** ===
+# === *** (UPDATED 11-12) 重構為 get_all_values *** ===
+def handle_search_records_nlp(sheet, user_id, full_text, event_time):
+    """
+    處理關鍵字和日期區間查詢 (使用 NLP)
+    (已升級，支援收入/支出過濾)
+    (MODIFIED 11-12) 重構為 get_all_values
+    """
+    logger.debug(f"處理 'NLP 查詢'，user_id: {user_id}, query: {full_text}")
+
+    try:
+        parsed_query = call_search_nlp(full_text, event_time)
+        if parsed_query.get('status') == 'failure':
+            return parsed_query.get('message', "🦝 查詢失敗，我不太懂您的意思。")
+
+        keyword = parsed_query.get('keyword')
+        start_date = parsed_query.get('start_date')
+        end_date = parsed_query.get('end_date')
+        # (FIX #3) 獲取新的 'type' 欄位
+        query_type = parsed_query.get('type', 'all') 
+        nlp_message = parsed_query.get('message', f"關於「{full_text}」")
+            
+    except Exception as e:
+        logger.error(f"查詢的 NLP 解析失敗：{e}", exc_info=True)
+        return f"查詢失敗：AI 分析器出錯：{str(e)}"
+        
+    logger.debug(f"NLP 解析查詢結果：Keyword: {keyword}, Start: {start_date}, End: {end_date}, Type: {query_type}")
+
+    # (NEW 11-12) 效能優化
+    all_values = sheet.get_all_values()
+    if not all_values or len(all_values) < 2:
+        return f"🦝 找不到關於「{nlp_message}」的任何記錄喔 (帳本是空的)！"
+        
+    header = all_values[0]
+    try:
+        idx_uid = header.index('使用者ID')
+        idx_time_new = header.get('日期', -1)
+        idx_time_old = header.get('時間', -1)
+        idx_amount = header.index('金額')
+        idx_cat = header.index('類別')
+        idx_note = header.index('備註')
+    except (ValueError, KeyError) as e:
+        logger.error(f"GSheet 標頭錯誤 (handle_search_records_nlp): {e}")
+        return "查詢失敗：GSheet 標頭欄位缺失。"
+
+    matches = []
+    
+    try:
+        start_dt = datetime.strptime(start_date, '%Y-%m-%d').date() if start_date else None
+        end_dt = datetime.strptime(end_date, '%Y-%m-%d').date() if end_date else None
+    except ValueError as e:
+        return f"AI 回傳的日期格式錯誤 ({start_date}, {end_date})。"
+
+    # (NEW 11-12) 遍歷原始 list
+    for r in all_values[1:]:
+        if len(r) <= max(idx_uid, idx_time_new, idx_time_old, idx_amount, idx_cat, idx_note):
+            continue
+            
+        if r[idx_uid] != user_id:
+            continue
+        
+        keyword_match = True
+        date_match = True
+        type_match = True # (FIX #3) 新增類型比對
+        
+        # 1. 關鍵字比對
+        category_val = r[idx_cat] if r[idx_cat] else ''
+        notes_val = r[idx_note] if r[idx_note] else ''
+        if keyword:
+            keyword_match = (keyword in category_val) or (keyword in notes_val)
+        
+        # 2. 日期比對
+        record_time_str = ""
+        if idx_time_new != -1 and len(r) > idx_time_new and r[idx_time_new]:
+            record_time_str = r[idx_time_new]
+        elif idx_time_old != -1 and len(r) > idx_time_old and r[idx_time_old]:
+            record_time_str = r[idx_time_old]
+            
+        if (start_dt or end_dt) and record_time_str:
+            try:
+                record_dt = datetime.strptime(record_time_str[:10], '%Y-%m-%d').date()
+                if start_dt and record_dt < start_dt: date_match = False
+                if end_dt and record_dt > end_dt: date_match = False
+            except ValueError:
+                date_match = False 
+        
+        # 3. (FIX #3) 類型比對 (收入/支出)
+        try:
+            amount = float(r[idx_amount])
+            if query_type == 'income' and amount <= 0: # 收入 (必須 > 0)
+                type_match = False
+            if query_type == 'expense' and amount >= 0: # 支出 (必須 < 0)
+                type_match = False
+        except (ValueError, TypeError):
+            type_match = False # 金額格式錯誤，過濾掉
+        
+        # 必須全部符合
+        if keyword_match and date_match and type_match:
+            # (NEW 11-12) 儲存原始的 row (list)，並附上時間戳 (用於排序)
+            matches.append((record_time_str, r))
+    
+    if not matches:
+        return f"🦝 找不到關於「{nlp_message}」的任何記錄喔！"
+    
+    reply = f"🔎 {nlp_message} (共 {len(matches)} 筆)：\n\n"
+    limit = 20 
+    
+    # (NEW 11-12) 排序
+    sorted_matches = sorted(matches, key=lambda x: x[0], reverse=True)
+    
+    total_amount_all_matches = 0.0
+    
+    for (date_str, r) in sorted_matches:
+         try:
+            amount = float(r[idx_amount])
+            total_amount_all_matches += amount
+            
+            if len(reply.split('\n')) <= limit + 5: 
+                category = r[idx_cat]
+                notes = r[idx_note]
+                
+                if not date_str:
+                     display_date = "N/A"
+                else:
+                    try:
+                        if len(date_str) > 10:
+                            display_date = datetime.strptime(date_str, '%Y-%m-%d %H:%M:%S').strftime('%Y-%m-%d %H:%M')
+                        else:
+                            display_date = datetime.strptime(date_str, '%Y-%m-%d').strftime('%Y-%m-%d')
+                    except ValueError:
+                        display_date = date_str 
+                
+                reply += f"• {display_date} {notes} ({category}) {amount:.0f} 元\n"
+                
+         except (ValueError, TypeError):
+            continue
+    
+    reply += f"\n--------------------\n"
+    reply += f"📈 查詢總計：{total_amount_all_matches:.0f} 元\n"
+    
+    if len(matches) > limit:
+        reply += f"(僅顯示最近 {limit} 筆記錄)"
+        
+    return reply
 
 def handle_add_category(cat_sheet, user_id, text):
     """
@@ -239,7 +382,71 @@ def handle_add_category(cat_sheet, user_id, text):
     except Exception as e:
         logger.error(f"新增類別失敗：{e}", exc_info=True)
         return f"新增類別時發生錯誤：{str(e)}"
+# (MODIFIED 11-12) 重構為 get_all_values
+def handle_total_analysis(sheet, user_id):
+    """
+    處理 '總收支分析' 指令 (現在也包含了 '查帳')
+    """
+    logger.debug(f"處理 '總收支分析 / 查帳' (新版)，user_id: {user_id}")
+    try:
+        # (NEW 11-12) 效能優化
+        all_values = sheet.get_all_values()
+        if not all_values or len(all_values) < 2:
+            return "您目前沒有任何記帳記錄喔！"
 
+        header = all_values[0]
+        # 1. 先定義欄位索引
+        try:
+            idx_uid = header.index('使用者ID')
+            idx_amount = header.index('金額')
+            idx_cat = header.index('類別')
+        except (ValueError, KeyError) as e:
+            logger.error(f"GSheet 標頭錯誤 (handle_total_analysis): {e}")
+            return "分析失敗：GSheet 標頭欄位缺失。"
+
+        total_income = 0.0
+        total_expense = 0.0
+        category_spending = {}
+
+        # 2. 遍歷原始列表 (跳過標頭)
+        for r in all_values[1:]:
+            # 確保欄位足夠且是這位使用者
+            if len(r) > max(idx_uid, idx_amount, idx_cat) and r[idx_uid] == user_id:
+                try:
+                    amount = float(r[idx_amount])
+                    if amount > 0:
+                        total_income += amount
+                    else:
+                        expense = abs(amount)
+                        total_expense += expense
+                        category = r[idx_cat] if r[idx_cat] else '雜項'
+                        category_spending[category] = category_spending.get(category, 0) + expense
+                except (ValueError, TypeError):
+                    continue
+        
+        if total_income == 0 and total_expense == 0:
+             return "您目前沒有任何記帳記錄喔！"
+             
+        reply = f"📈 **您的總收支分析** (從開始記帳至今)：\n\n"
+        reply += f"💰 總收入：{total_income:.0f} 元\n"
+        reply += f"💸 總支出：{total_expense:.0f} 元\n"
+        reply += f"📊 淨餘額：{total_income - total_expense:.0f} 元\n"
+        
+        if category_spending:
+            reply += "\n--- 總支出類別分析 (花費最多) ---\n"
+            sorted_spending = sorted(category_spending.items(), key=lambda item: item[1], reverse=True)
+            
+            for i, (category, amount) in enumerate(sorted_spending):
+                percentage = (amount / total_expense) * 100 if total_expense > 0 else 0
+                icon = ["🥇", "🥈", "🥉"]
+                prefix = icon[i] if i < 3 else "🔹"
+                reply += f"{prefix} {category}: {amount:.0f} 元 (佔 {percentage:.1f}%)\n"
+        
+        return reply
+    except Exception as e:
+        logger.error(f"總收支分析失败：{e}", exc_info=True)
+        return f"總收支分析報表產生失败：{str(e)}"
+    
 def handle_delete_category(cat_sheet, user_id, text):
     """
     (新) 處理「刪除類別」指令
@@ -766,6 +973,8 @@ def _try_collapse_add_expr_from_text(original_text: str, records: list):
 # *** (UPDATED 11-04) ***
 # === (MODIFIED) `handle_nlp_record` (記帳) (動態類別 + Bug 修正) ===
 # *** (UPDATED 11-05 v3) ***
+# === (MODIFIED) `handle_nlp_record` (記帳) (動態類別 + Bug 修正) ===
+# *** (UPDATED 11-12 v4) ***
 def handle_nlp_record(sheet, budget_sheet, cat_sheet, text, user_id, user_name, event_time):
     """
     (MODIFIED) 使用 Gemini NLP 處理自然語言記帳 (記帳、聊天、查詢、系統問題)
@@ -816,10 +1025,7 @@ def handle_nlp_record(sheet, budget_sheet, cat_sheet, text, user_id, user_name, 
     date_context = "\n".join(date_context_lines)
     # === (*** END 11-05 v3 ***) ===
     
-    # === (*** MODIFIED 11-05 v3 ***) ===
-    # 1. 調整規則順序 (Failure/Chat 優先)
-    # 2. 增加更多無意義輸入的範例 (..., …, ：：：)
-    # 3. 增加日期對照表的使用規則 (規則 1.1)
+    # === (*** MODIFIED 11-12 v4 ***) ===
     prompt_raw = """
     你是一個記帳機器人的 AI 助手，你的名字是「記帳小浣熊🦝」。
     使用者的輸入是：「$TEXT」
@@ -872,11 +1078,11 @@ def handle_nlp_record(sheet, budget_sheet, cat_sheet, text, user_id, user_name, 
            - (規則 1.4) **時段關鍵字 (僅供參考)**:
                - 如果使用者輸入 "早餐 50"，且「傳送時間」是 09:30，則判斷為補記帳，使用 $TODAY 08:00:00。
                - 如果使用者輸入 "午餐 100"，且「傳送時間」是 14:00，則判斷為補記帳，使用 $TODAY 12:00:00。
-               - (新規則 1.4.1) 如果使用者輸入的「備註」*同時包含*品項和時段 (例如 "麥當勞早餐 80", "宵夜雞排 90")，請*優先*套用時段時間 (例如 "麥當勞早餐 80" -> `datetime: "$TODAY 08:00:00"`, `category: "餐飲"`, `notes: "麥當勞早餐"`)。
+               - (新規則 1.4.1) 如果使用者輸入的「備註」*同時包含*品項和時段 (例如 "麥當勞早餐 80", "宵夜雞排 90")，請*優先*套用時段時間 (例如 "麥當L早餐 80" -> `datetime: "$TODAY 08:00:00"`, `category: "餐飲"`, `notes: "麥當勞早餐"`)。
 
        - category: (動態) 必須是 [ $USER_CATEGORIES_LIST ] 之一。
        - amount: 支出必須為負數 (-)，收入必須為正數 (+)。
-       - notes: 盡可能擷取出花費的「品項」。
+       - **(v4 修改點)** notes: 盡可能擷取出花費的「品項」與「重要描述」(例如 '信用卡買書')。
        - message: "記錄成功"
 
     ⚠️ 規則補充：
@@ -888,36 +1094,34 @@ def handle_nlp_record(sheet, budget_sheet, cat_sheet, text, user_id, user_name, 
     # (Failure 範例 - 規則 5)
     輸入: "..." (規則 5.3) -> {"status": "failure", "data": null, "message": "🦝？ 請問需要我做什麼嗎？"}
     輸入: "????" (規則 5.3) -> {"status": "failure", "data": null, "message": "🦝？"}
-    輸入: "////" (規則 5.3) -> {"status": "failure", "data": null, "message": "🦝？"}
-    輸入: "：" (規則 5.3) -> {"status": "failure", "data": null, "message": "🦝？"}
     輸入: "…" (規則 5.3) -> {"status": "failure", "data": null, "message": "🦝？"}
     輸入: "宵夜" (規則 5.1) -> {"status": "failure", "data": null, "message": "🦝？ 宵夜吃了什麼？花了多少錢呢？"}
     
     # (Chat 範例 - 規則 2)
     輸入: "我今天晚餐吃了烤肉沒花錢" (規則 2.1) -> {"status": "chat", "data": null, "message": "哇！真幸運！🦝"}
-    輸入: "朋友請我吃火鍋" (規則 2.1) -> {"status": "chat", "data": null, "message": "真好～有人請客！"}
-    輸入: "你好" -> {"status": "chat", "data": null, "message": "哈囉！我是記帳小浣熊🦝 需要幫忙記帳嗎？還是想聊聊天呀？"}
+    輸入: "你好" -> {"status": "chat", "data": null, "message": "哈囉！我是記帳小浣熊🦝 需要幫忙記帳嗎？"}
     
     # (Query 範例 - 規則 3, 4)
     輸入: "我本月花太多嗎？" -> {"status": "query", "data": null, "message": "我本月花太多嗎？"}
     輸入: "目前有什麼項目?" -> {"status": "system_query", "data": null, "message": "請問您是指「我的類別」嗎？ 🦝 您可以輸入「我的類別」來查看喔！"}
 
     # (Success 範例 - 規則 1)
-    # (*** NEW 11-05 v3 ***) (增加星期幾的範例)
-    (假設今天是 2025-11-05 星期三)
+    (假設今天是 2025-11-12 星期三)
     輸入: "星期一 吃了雞排80" (規則 1.2)
-    輸出: {"status": "success", "data": [{"datetime": "2025-11-03 12:00:00", "category": "餐飲", "amount": -80, "notes": "雞排"}], "message": "記錄成功"}
+    輸出: {"status": "success", "data": [{"datetime": "2025-11-10 12:00:00", "category": "餐飲", "amount": -80, "notes": "雞排"}], "message": "記錄成功"}
 
     輸入: "前天 喝飲料 50" (規則 1.2)
-    輸出: {"status": "success", "data": [{"datetime": "2025-11-03 16:00:00", "category": "飲料", "amount": -50, "notes": "喝飲料"}], "message": "記錄成功"}
+    輸出: {"status": "success", "data": [{"datetime": "2025-11-10 16:00:00", "category": "飲料", "amount": -50, "notes": "喝飲料"}], "message": "記錄成功"}
 
     輸入: "昨天 晚餐 200" (規則 1.1)
-    輸出: {"status": "success", "data": [{"datetime": "2025-11-04 18:00:00", "category": "餐飲", "amount": -200, "notes": "晚餐"}], "message": "記錄成功"}
+    輸出: {"status": "success", "data": [{"datetime": "2025-11-11 18:00:00", "category": "餐飲", "amount": -200, "notes": "晚餐"}], "message": "記錄成功"}
 
-    輸入: "今天中午吃了雞排80" (規則 1.1) -> {"status": "success", "data": [{"datetime": "2025-11-05 12:00:00", "category": "餐飲", "amount": -80, "notes": "雞排"}], "message": "記錄成功"}
     輸入: "香蕉 20" (規則 1.3) -> {"status": "success", "data": [{"datetime": "$CURRENT_TIME", "category": "餐飲", "amount": -20, "notes": "香蕉"}], "message": "記錄成功"}
-    輸入: "麥當勞早餐 80" (規則 1.4.1) -> {"status": "success", "data": [{"datetime": "$TODAY 08:00:00", "category": "餐飲", "amount": -80, "notes": "麥當勞早餐"}], "message": "記錄成功"}
-    輸入: "打牌 贏30元" -> {"status": "success", "data": [{"datetime": "$CURRENT_TIME", "category": "收入", "amount": 30, "notes": "打牌 贏"}], "message": "記錄成功"}
+    
+    # (v4 新增範例)
+    輸入: "今天16:30用信用卡購買書籍350元"
+    輸出: {"status": "success", "data": [{"datetime": "2025-11-12 16:30:00", "category": "購物", "amount": -350, "notes": "信用卡購買書籍"}], "message": "記錄成功"}
+
     輸入: "午餐100 晚餐200" (規則 1) -> {"status": "success", "data": [{"datetime": "$TODAY 12:00:00", "category": "餐飲", "amount": -100, "notes": "午餐"}, {"datetime": "$TODAY 18:00:00", "category": "餐飲", "amount": -200, "notes": "晚餐"}], "message": "記錄成功"}
     """
     prompt = Template(prompt_raw).substitute(
@@ -1018,7 +1222,7 @@ def handle_nlp_record(sheet, budget_sheet, cat_sheet, text, user_id, user_name, 
             return handle_conversational_query_advice(sheet, budget_sheet, text, user_id, user_name, event_time)
         
         else: # status == 'failure'
-            return message or "🦝？ 抱歉，我聽不懂..."
+            return message or "🦝？ 抱歉，我聽不懂喔..."
 
     except json.JSONDecodeError as e:
         logger.error(f"Gemini NLP JSON 解析失敗: {clean_response}")
@@ -1030,41 +1234,65 @@ def handle_nlp_record(sheet, budget_sheet, cat_sheet, text, user_id, user_name, 
 # === *** (DELETED) `handle_check_balance` 已被刪除 *** ===
 # (因為 handle_total_analysis 更好)
 
+# (MODIFIED 11-12) 重構為 get_all_values
 def handle_monthly_report(sheet, user_id, event_time):
     """
     處理 '月結' 指令
     """
     logger.debug(f"處理 '月結' 指令，user_id: {user_id}")
     try:
-        records = sheet.get_all_records()
+        # (NEW 11-12) 效能優化
+        all_values = sheet.get_all_values()
+        if not all_values or len(all_values) < 2:
+            return "您的帳本是空的，沒有記錄可分析。"
+            
+        header = all_values[0]
+        try:
+            idx_uid = header.index('使用者ID')
+            idx_time_new = header.get('日期', -1)
+            idx_time_old = header.get('時間', -1)
+            idx_amount = header.index('金額')
+            idx_cat = header.index('類別')
+        except (ValueError, KeyError) as e:
+            logger.error(f"GSheet 標頭錯誤 (handle_monthly_report): {e}")
+            return "月結失敗：GSheet 標頭欄位缺失。"
+
         current_month_str = event_time.strftime('%Y-%m')
         
-        user_month_records = []
-        for r in records:
-            record_time_str = get_datetime_from_record(r)
-            if (r.get('使用者ID') == user_id and 
-                record_time_str.startswith(current_month_str)):
-                user_month_records.append(r)
-        
-        if not user_month_records:
-            return f"📅 {current_month_str} 月報表：\n您這個月還沒有任何記錄喔！"
-
         total_income = 0.0
         total_expense = 0.0
         category_spending = {}
 
-        for r in user_month_records:
-            try:
-                amount = float(r.get('金額', 0))
-                if amount > 0:
-                    total_income += amount
-                else:
-                    total_expense += amount
-                    category = r.get('類別', '雜項')
-                    category_spending[category] = category_spending.get(category, 0) + abs(amount)
-            except (ValueError, TypeError):
+        # (NEW 11-12) 遍歷原始 list
+        for r in all_values[1:]:
+            if len(r) <= max(idx_uid, idx_time_new, idx_time_old, idx_amount, idx_cat):
                 continue
+                
+            if r[idx_uid] != user_id:
+                continue
+                
+            # (NEW) 優先讀取 '日期'，再讀取 '時間'
+            record_time_str = ""
+            if idx_time_new != -1 and len(r) > idx_time_new and r[idx_time_new]:
+                record_time_str = r[idx_time_new]
+            elif idx_time_old != -1 and len(r) > idx_time_old and r[idx_time_old]:
+                record_time_str = r[idx_time_old]
+
+            if record_time_str.startswith(current_month_str):
+                try:
+                    amount = float(r[idx_amount])
+                    if amount > 0:
+                        total_income += amount
+                    else:
+                        total_expense += amount
+                        category = r[idx_cat] if r[idx_cat] else '雜項'
+                        category_spending[category] = category_spending.get(category, 0) + abs(amount)
+                except (ValueError, TypeError):
+                    continue
         
+        if total_income == 0 and total_expense == 0:
+            return f"📅 {current_month_str} 月報表：\n您這個月還沒有任何記錄喔！"
+
         reply = f"📅 **{current_month_str} 月結報表**：\n\n"
         reply += f"💰 本月收入：{total_income:.0f} 元\n"
         reply += f"💸 本月支出：{abs(total_expense):.0f} 元\n"
@@ -1084,14 +1312,29 @@ def handle_monthly_report(sheet, user_id, event_time):
         logger.error(f"月結失敗：{e}", exc_info=True)
         return f"月結報表產生失敗：{str(e)}"
 
+# (MODIFIED 11-12) 重構為 get_all_values
 def handle_weekly_report(sheet, user_id, event_time):
     """
     處理 '本週重點' 指令
     """
     logger.debug(f"處理 '本週重點' 指令，user_id: {user_id}")
     try:
-        records = sheet.get_all_records()
-        
+        # (NEW 11-12) 效能優化
+        all_values = sheet.get_all_values()
+        if not all_values or len(all_values) < 2:
+            return "您的帳本是空的，沒有記錄可分析。"
+            
+        header = all_values[0]
+        try:
+            idx_uid = header.index('使用者ID')
+            idx_time_new = header.get('日期', -1)
+            idx_time_old = header.get('時間', -1)
+            idx_amount = header.index('金額')
+            idx_cat = header.index('類別')
+        except (ValueError, KeyError) as e:
+            logger.error(f"GSheet 標頭錯誤 (handle_weekly_report): {e}")
+            return "週報表失敗：GSheet 標頭欄位缺失。"
+
         today = event_time.date()
         start_of_week = today - timedelta(days=today.weekday())
         end_of_week = start_of_week + timedelta(days=6)
@@ -1101,45 +1344,47 @@ def handle_weekly_report(sheet, user_id, event_time):
 
         logger.debug(f"本週區間：{start_of_week_str} 到 {end_of_week_str}")
 
-        user_week_records = []
-        for r in records:
-            if r.get('使用者ID') != user_id:
+        total_expense = 0.0
+        category_spending = {}
+        day_spending = {} 
+
+        # (NEW 11-12) 遍歷原始 list
+        for r in all_values[1:]:
+            if len(r) <= max(idx_uid, idx_time_new, idx_time_old, idx_amount, idx_cat):
                 continue
                 
-            record_time_str = get_datetime_from_record(r)
+            if r[idx_uid] != user_id:
+                continue
+            
+            # (NEW) 優先讀取 '日期'，再讀取 '時間'
+            record_time_str = ""
+            if idx_time_new != -1 and len(r) > idx_time_new and r[idx_time_new]:
+                record_time_str = r[idx_time_new]
+            elif idx_time_old != -1 and len(r) > idx_time_old and r[idx_time_old]:
+                record_time_str = r[idx_time_old]
+                
             if not record_time_str:
                 continue
             
             try:
                 record_date = datetime.strptime(record_time_str[:10], '%Y-%m-%d').date()
                 if start_of_week <= record_date <= end_of_week:
-                    user_week_records.append(r)
-            except ValueError:
-                continue
-        
-        if not user_week_records:
-            return f"📊 本週摘要 ({start_of_week_str} ~ {end_of_week_str})：\n您這週還沒有任何記錄喔！"
-
-        total_expense = 0.0
-        category_spending = {}
-        day_spending = {} 
-
-        for r in user_week_records:
-            try:
-                amount = float(r.get('金額', 0))
-                if amount < 0:
-                    expense = abs(amount)
-                    total_expense += expense
-                    
-                    category = r.get('類別', '雜項')
-                    category_spending[category] = category_spending.get(category, 0) + expense
-                    
-                    record_date_str = get_datetime_from_record(r)[:10]
-                    day_spending[record_date_str] = day_spending.get(record_date_str, 0) + expense
-                    
+                    amount = float(r[idx_amount])
+                    if amount < 0:
+                        expense = abs(amount)
+                        total_expense += expense
+                        
+                        category = r[idx_cat] if r[idx_cat] else '雜項'
+                        category_spending[category] = category_spending.get(category, 0) + expense
+                        
+                        record_date_str = record_time_str[:10]
+                        day_spending[record_date_str] = day_spending.get(record_date_str, 0) + expense
             except (ValueError, TypeError):
                 continue
         
+        if total_expense == 0:
+            return f"📊 本週摘要 ({start_of_week_str} ~ {end_of_week_str})：\n您這週還沒有任何記錄喔！"
+
         reply = f"📊 **本週花費摘要** ({start_of_week_str} ~ {end_of_week_str})：\n"
         reply += f"💸 本週總支出：{total_expense:.0f} 元\n\n"
         
@@ -1167,56 +1412,6 @@ def handle_weekly_report(sheet, user_id, event_time):
     except Exception as e:
         logger.error(f"本週重點失敗：{e}", exc_info=True)
         return f"本週重點報表產生失敗：{str(e)}"
-
-def handle_total_analysis(sheet, user_id):
-    """
-    處理 '總收支分析' 指令 (現在也包含了 '查帳')
-    """
-    logger.debug(f"處理 '總收支分析 / 查帳' 指令，user_id: {user_id}")
-    try:
-        records = sheet.get_all_records()
-        user_records = [r for r in records if r.get('使用者ID') == user_id]
-        
-        if not user_records:
-            return "您目前沒有任何記帳記錄喔！"
-
-        total_income = 0.0
-        total_expense = 0.0
-        category_spending = {}
-
-        for r in user_records:
-            try:
-                amount = float(r.get('金額', 0))
-                if amount > 0:
-                    total_income += amount
-                else:
-                    expense = abs(amount)
-                    total_expense += expense
-                    category = r.get('類別', '雜項')
-                    category_spending[category] = category_spending.get(category, 0) + expense
-            except (ValueError, TypeError):
-                continue
-        
-        reply = f"📈 **您的總收支分析** (從開始記帳至今)：\n\n"
-        reply += f"💰 總收入：{total_income:.0f} 元\n"
-        reply += f"💸 總支出：{total_expense:.0f} 元\n"
-        reply += f"📊 淨餘額：{total_income - total_expense:.0f} 元\n"
-        
-        if category_spending:
-            reply += "\n--- 總支出類別分析 (花費最多) ---\n"
-            sorted_spending = sorted(category_spending.items(), key=lambda item: item[1], reverse=True)
-            
-            for i, (category, amount) in enumerate(sorted_spending):
-                percentage = (amount / total_expense) * 100 if total_expense > 0 else 0
-                icon = ["🥇", "🥈", "🥉"]
-                prefix = icon[i] if i < 3 else "🔹"
-                reply += f"{prefix} {category}: {amount:.0f} 元 (佔 {percentage:.1f}%)\n"
-        
-        return reply
-    except Exception as e:
-        logger.error(f"總收支分析失败：{e}", exc_info=True)
-        return f"總收支分析報表產生失败：{str(e)}"
-
 
 def handle_delete_last_record(sheet, user_id):
     """
@@ -1531,6 +1726,7 @@ def handle_set_budget(sheet, cat_sheet, text, user_id):
         logger.error(f"設置預算失敗：{e}", exc_info=True)
         return f"設置預算失敗：{str(e)}"
 
+# (MODIFIED 11-12) 重構 trx_sheet 的讀取
 def handle_view_budget(trx_sheet, budget_sheet, user_id, event_time):
     """
     處理 '查看預算' 指令
@@ -1543,21 +1739,55 @@ def handle_view_budget(trx_sheet, budget_sheet, user_id, event_time):
         if not user_budgets:
             return "您尚未設置任何預算。請輸入「設置預算 [類別] [限額]」"
 
-        transactions_records = trx_sheet.get_all_records()
+        # (NEW 11-12) 效能優化
+        all_values = trx_sheet.get_all_values()
+        
+        header = []
+        trx_data_rows = []
+        if all_values and len(all_values) >= 2:
+            header = all_values[0]
+            trx_data_rows = all_values[1:]
+        else:
+            logger.warning("查看預算時，Transactions GSheet 為空")
+            
+        header_map = {name: i for i, name in enumerate(header)}
+        
+        # 必須的欄位
+        if '使用者ID' not in header_map or '金額' not in header_map or '類別' not in header_map:
+             logger.error("GSheet 標頭錯誤 (handle_view_budget): 關鍵欄位缺失")
+             # 即使 GSheet 為空，也回傳預算限額
+        
+        idx_uid = header_map.get('使用者ID', -1)
+        idx_time_new = header_map.get('日期', -1)
+        idx_time_old = header_map.get('時間', -1)
+        idx_amount = header_map.get('金額', -1)
+        idx_cat = header_map.get('類別', -1)
+
         current_month_str = event_time.strftime('%Y-%m')
         
-        user_month_expenses = []
-        for r in transactions_records:
-            try:
-                amount = float(r.get('金額', 0))
-                record_time_str = get_datetime_from_record(r)
-                
-                if (r.get('使用者ID') == user_id and
-                    record_time_str.startswith(current_month_str) and
-                    amount < 0):
-                    user_month_expenses.append(r)
-            except (ValueError, TypeError):
-                continue
+        # (NEW 11-12) 預先計算本月花費 (快)
+        monthly_spending = {}
+        if idx_uid != -1: # 只有在 GSheet 欄位都正常時才計算
+            for r in trx_data_rows:
+                if len(r) <= max(idx_uid, idx_time_new, idx_time_old, idx_amount, idx_cat):
+                    continue
+                if r[idx_uid] != user_id:
+                    continue
+                    
+                record_time_str = ""
+                if idx_time_new != -1 and len(r) > idx_time_new and r[idx_time_new]:
+                    record_time_str = r[idx_time_new]
+                elif idx_time_old != -1 and len(r) > idx_time_old and r[idx_time_old]:
+                    record_time_str = r[idx_time_old]
+
+                if record_time_str.startswith(current_month_str):
+                    try:
+                        amount = float(r[idx_amount])
+                        if amount < 0:
+                            category = r[idx_cat] if r[idx_cat] else '雜項'
+                            monthly_spending[category] = monthly_spending.get(category, 0) + abs(amount)
+                    except (ValueError, TypeError):
+                        continue
 
         reply = f"📊 **{current_month_str} 預算狀態**：\n"
         total_spent = 0.0
@@ -1570,8 +1800,10 @@ def handle_view_budget(trx_sheet, budget_sheet, user_id, event_time):
                 continue
                 
             total_limit += limit
-            spent = sum(abs(float(r.get('金額', 0))) for r in user_month_expenses if r.get('類別') == category)
+            # (NEW 11-12) 從預先計算的 dict 中取值
+            spent = monthly_spending.get(category, 0)
             total_spent += spent
+            
             remaining = limit - spent
             percentage = (spent / limit) * 100 if limit > 0 else 0
             
@@ -1593,7 +1825,7 @@ def handle_view_budget(trx_sheet, budget_sheet, user_id, event_time):
         reply += "\n--------------------\n"
         if total_limit > 0:
             total_remaining = total_limit - total_spent
-            total_percentage = (total_spent / total_limit) * 100
+            total_percentage = (total_spent / total_limit) * 100 if total_spent > 0 else 0
             status_icon = "🟢" if total_remaining >= 0 else "🔴"
             
             reply += f"總預算： {total_limit:.0f} 元\n"
@@ -1611,35 +1843,46 @@ def handle_view_budget(trx_sheet, budget_sheet, user_id, event_time):
 # (修改點) 增加 user_name 參數
 # *** (UPDATED 11-02) ***
 # (修改點) 增加 user_name 參數
+# *** (UPDATED 11-12) ***
+# (修改點) 增加 user_name 參數
+# (重構) 改用 get_all_values
 def handle_conversational_query_advice(trx_sheet, budget_sheet, text, user_id, user_name, event_time):
     """
     (新功能) 處理 "詢問建議" (例如 "我花太多嗎", "有什麼建議")
+    (MODIFIED 11-12) 重構為 get_all_values
     """
     logger.debug(f"處理 '聊天式建議'，user_id: {user_id}, text: {text}")
 
     try:
-        # === (NEW) 步驟 0: 效能優化 (主要修復點) ===
-        # 1. 一次性讀取所有 GSheet 記錄 (從 Transactions)
-        logger.debug("Optimizing: 正在讀取所有交易紀錄 (僅一次)...")
-        all_records = trx_sheet.get_all_records()
+        # === (NEW 11-12) 步驟 0: 效能優化 (主要修復點) ===
+        # 1. 一次性讀取所有 GSheet 原始值
+        logger.debug("Optimizing: 正在讀取所有交易紀錄 (get_all_values)...")
+        all_values = trx_sheet.get_all_values()
         
-        # 2. 在 Python 中過濾出這位使用者的所有記錄
-        logger.debug(f"Optimizing: 正在過濾使用者 {user_id} 的記錄...")
-        user_all_records = [r for r in all_records if r.get('使用者ID') == user_id]
-        logger.debug(f"Optimizing: 找到 {len(user_all_records)} 筆記錄。")
+        if not all_values or len(all_values) < 2:
+            logger.warning("GSheet (Transactions) 為空或只有標頭")
+            return "🦝 您的帳本還是空的，沒辦法給建議喔～"
+            
+        header = all_values[0]
+        # (NEW) 建立標頭索引地圖
+        header_map = {name: i for i, name in enumerate(header)}
+        # (NEW) 傳遞 (標頭之後) 的所有資料
+        trx_data_rows = all_values[1:]
         # ==========================================
 
         # 1. 取得本月資料 (使用你的輔助函式)
         this_month_date = event_time.date()
-        # (MODIFIED) 傳入 user_all_records 列表
-        this_month_data = get_spending_data_for_month(user_all_records, this_month_date.year, this_month_date.month)
+        # (MODIFIED 11-12) 傳入 (values, map, user_id, ...)
+        this_month_data = get_spending_data_for_month(trx_data_rows, header_map, user_id, this_month_date.year, this_month_date.month)
         
         # 2. 取得上月資料
         last_month_end_date = this_month_date.replace(day=1) - timedelta(days=1)
-        # (MODIFIED) 傳入 user_all_records 列表 (重複使用)
-        last_month_data = get_spending_data_for_month(user_all_records, last_month_end_date.year, last_month_end_date.month)
+        # (MODIFIED 11-12) 重複使用 (values, map)
+        last_month_data = get_spending_data_for_month(trx_data_rows, header_map, user_id, last_month_end_date.year, last_month_end_date.month)
+        
         this_month_total = this_month_data['total']
         last_month_total = last_month_data['total']
+        
         # 3. 取得預算資料 (這個 OK，budget_sheet 通常很小)
         budgets_records = budget_sheet.get_all_records()
         user_budgets = [b for b in budgets_records if b.get('使用者ID') == user_id]
@@ -1691,161 +1934,62 @@ def handle_conversational_query_advice(trx_sheet, budget_sheet, text, user_id, u
         logger.error(f"聊天式建議失敗：{e}", exc_info=True)
         return f"糟糕！小浣熊分析時打結了：{str(e)}"
 
-# === (MODIFIED) 
+# === (MODIFIED 11-12) 
 # 1. 移除 sheet, user_id 參數
-# 2. 改為接收 user_records_list (一個 Python list)
-def get_spending_data_for_month(user_records_list, year, month):
+# 2. 改為接收 (all_values, header_map, user_id, year, month)
+def get_spending_data_for_month(all_trx_values, header_map, user_id, year, month):
     """
-    (MODIFIED) 獲取特定年/月，某使用者的總支出和分類支出 (從傳入的 list)
+    (MODIFIED 11-12) 獲取特定年/月，某使用者的總支出和分類支出 (從傳入的 values list)
     """
     # 3. 更新 log
-    logger.debug(f"輔助函式：分析 {year}-{month} 的資料 (從 {len(user_records_list)} 筆記錄中)")
+    logger.debug(f"輔助函式：分析 {year}-{month} 的資料 (從 {len(all_trx_values)} 筆記錄中)")
     month_str = f"{year}-{month:02d}"
     
     total_expense = 0.0
     category_spending = {}
     
-    # 4. (REMOVED) 移除慢速的 GSheet 讀取
-    # records = sheet.get_all_records() 
+    # 4. (NEW) 獲取欄位索引
+    try:
+        idx_uid = header_map['使用者ID']
+        idx_time_new = header_map.get('日期', -1) # 新
+        idx_time_old = header_map.get('時間', -1) # 舊
+        idx_amount = header_map['金額']
+        idx_cat = header_map['類別']
+    except KeyError as e:
+        logger.error(f"GSheet 標頭錯誤 (get_spending_data_for_month): {e}")
+        return {"total": 0, "categories": {}}
 
     # 5. (MODIFIED) 
-    for r in user_records_list:
-        record_time_str = get_datetime_from_record(r)
-        
-        # 6. (MODIFIED) 
-        #    因為傳入的 list 已經是這個 user_id 的了，
-        #    所以 *不再需要* 檢查 r.get('使用者ID') == user_id
-        if record_time_str.startswith(month_str):
+    for r in all_trx_values: # 傳進來的 all_trx_values 應該已經不含 header
+        if len(r) <= max(idx_uid, idx_time_new, idx_time_old, idx_amount, idx_cat):
+            continue # 跳過不完整的行
             
+        # 6. (MODIFIED) 
+        if r[idx_uid] != user_id:
+            continue
+            
+        # (NEW) 優先讀取 '日期'，再讀取 '時間'
+        record_time_str = ""
+        if idx_time_new != -1 and len(r) > idx_time_new and r[idx_time_new]:
+            record_time_str = r[idx_time_new]
+        elif idx_time_old != -1 and len(r) > idx_time_old and r[idx_time_old]:
+            record_time_str = r[idx_time_old]
+
+        if record_time_str.startswith(month_str):
             try:
-                amount = float(r.get('金額', 0))
+                amount = float(r[idx_amount])
                 if amount < 0:
                     expense = abs(amount)
                     total_expense += expense
-                    category = r.get('類別', '雜項')
+                    category = r[idx_cat] if r[idx_cat] else '雜項'
                     category_spending[category] = category_spending.get(category, 0) + expense
             except (ValueError, TypeError):
                 continue
                 
     return {"total": total_expense, "categories": category_spending}
 
-
-# === *** (MODIFIED) 步驟三-B: 升級 `handle_search_records_nlp` (修復 Bug #3) *** ===
-def handle_search_records_nlp(sheet, user_id, full_text, event_time):
-    """
-    處理關鍵字和日期區間查詢 (使用 NLP)
-    (已升級，支援收入/支出過濾)
-    """
-    logger.debug(f"處理 'NLP 查詢'，user_id: {user_id}, query: {full_text}")
-
-    try:
-        parsed_query = call_search_nlp(full_text, event_time)
-        if parsed_query.get('status') == 'failure':
-            return parsed_query.get('message', "🦝 查詢失敗，我不太懂您的意思。")
-
-        keyword = parsed_query.get('keyword')
-        start_date = parsed_query.get('start_date')
-        end_date = parsed_query.get('end_date')
-        # (FIX #3) 獲取新的 'type' 欄位
-        query_type = parsed_query.get('type', 'all') 
-        nlp_message = parsed_query.get('message', f"關於「{full_text}」")
-            
-    except Exception as e:
-        logger.error(f"查詢的 NLP 解析失敗：{e}", exc_info=True)
-        return f"查詢失敗：AI 分析器出錯：{str(e)}"
-        
-    logger.debug(f"NLP 解析查詢結果：Keyword: {keyword}, Start: {start_date}, End: {end_date}, Type: {query_type}")
-
-    records = sheet.get_all_records()
-    matches = []
-    
-    try:
-        start_dt = datetime.strptime(start_date, '%Y-%m-%d').date() if start_date else None
-        end_dt = datetime.strptime(end_date, '%Y-%m-%d').date() if end_date else None
-    except ValueError as e:
-        return f"AI 回傳的日期格式錯誤 ({start_date}, {end_date})。"
-
-    for r in records:
-        if r.get('使用者ID') != user_id:
-            continue
-        
-        keyword_match = True
-        date_match = True
-        type_match = True # (FIX #3) 新增類型比對
-        
-        # 1. 關鍵字比對
-        if keyword:
-            keyword_match = (keyword in r.get('類別', '')) or (keyword in r.get('備註', ''))
-        
-        # 2. 日期比對
-        record_datetime_str = get_datetime_from_record(r)
-        if (start_dt or end_dt) and record_datetime_str:
-            try:
-                record_dt = datetime.strptime(record_datetime_str[:10], '%Y-%m-%d').date()
-                if start_dt and record_dt < start_dt: date_match = False
-                if end_dt and record_dt > end_dt: date_match = False
-            except ValueError:
-                date_match = False 
-        
-        # 3. (FIX #3) 類型比對 (收入/支出)
-        try:
-            amount = float(r.get('金額', 0))
-            if query_type == 'income' and amount <= 0: # 收入 (必須 > 0)
-                type_match = False
-            if query_type == 'expense' and amount >= 0: # 支出 (必須 < 0)
-                type_match = False
-        except (ValueError, TypeError):
-            type_match = False # 金額格式錯誤，過濾掉
-        
-        # 必須全部符合
-        if keyword_match and date_match and type_match:
-            matches.append(r)
-    
-    if not matches:
-        return f"🦝 找不到關於「{nlp_message}」的任何記錄喔！"
-    
-    reply = f"🔎 {nlp_message} (共 {len(matches)} 筆)：\n\n"
-    limit = 20 
-    
-    sorted_matches = sorted(matches, key=lambda x: get_datetime_from_record(x), reverse=True)
-    
-    total_amount_all_matches = 0.0
-    
-    for r in sorted_matches:
-         try:
-            amount = float(r.get('金額', 0))
-            total_amount_all_matches += amount
-            
-            if len(reply.split('\n')) <= limit + 5: 
-                category = r.get('類別', 'N/A')
-                notes = r.get('備註', 'N/A')
-                date_str = get_datetime_from_record(r)
-                
-                if not date_str:
-                     display_date = "N/A"
-                else:
-                    try:
-                        if len(date_str) > 10:
-                            display_date = datetime.strptime(date_str, '%Y-%m-%d %H:%M:%S').strftime('%Y-%m-%d %H:%M')
-                        else:
-                            display_date = datetime.strptime(date_str, '%Y-%m-%d').strftime('%Y-%m-%d')
-                    except ValueError:
-                        display_date = date_str 
-                
-                reply += f"• {display_date} {notes} ({category}) {amount:.0f} 元\n"
-                
-         except (ValueError, TypeError):
-            continue
-    
-    reply += f"\n--------------------\n"
-    reply += f"📈 查詢總計：{total_amount_all_matches:.0f} 元\n"
-    
-    if len(matches) > limit:
-        reply += f"(僅顯示最近 {limit} 筆記錄)"
-        
-    return reply
-
 # === *** (MODIFIED) 步驟三-A: 升級 `call_search_nlp` (修復 Bug #3) *** ===
+# === *** (UPDATED 11-12 v4) *** ===
 def call_search_nlp(query_text, event_time):
     """
     (升級) 呼叫 Gemini NLP 來解析 "查詢" 或 "刪除" 的條件
@@ -1875,6 +2019,7 @@ def call_search_nlp(query_text, event_time):
     ]
     date_context = "\n".join(date_context_lines)
 
+    # (v4 修改點)
     prompt_raw = """
     你是一個查詢/刪除的「條件解析器」。
     使用者的輸入是：「$QUERY_TEXT」
@@ -1898,9 +2043,10 @@ def call_search_nlp(query_text, event_time):
     - 如果只有關鍵字 (例如 "雞排")，日期必須為空字串。
     - 刪除的語句 (例如 "刪掉", "移除") *不是* 關鍵字，真正的關鍵字是 "品項"。
     - (新規則) 如果查詢包含 "收入" 或 "賺"，"type" 應為 "income"。
-    - (新規則) 如果查詢包含 "支出" 或 "花費"，"type" V "expense"。
+    - (新規則) 如果查詢包含 "支出" 或 "花費"，"type" 應為 "expense"。
     - (新規則) 如果兩者都沒有，"type" 應為 "all"。
     - (新規則) "收入" 和 "支出" *不應* 被當作 "keyword" (關鍵字)。
+    - (v4 新規則) 如果關鍵字包含 "消費" 或 "金額"，請移除它們，只保留核心品項。例如 "信用卡消費" -> "信用卡"。
 
     範例：
     輸入: "查詢今天"
@@ -1913,7 +2059,7 @@ def call_search_nlp(query_text, event_time):
     輸出: {"status": "success", "keyword": "雞排", "start_date": "", "end_date": "", "type": "all", "message": "關於「雞排」"}
     
     輸入: "刪掉早上的草莓麵包"
-    輸出: {"status": "success", "keyword": "草莓麵B", "start_date": "$TODAY_STR", "end_date": "$TODAY_STR", "type": "all", "message": "今天早上的「草莓麵包」"}
+    輸出: {"status": "success", "keyword": "草莓麵包", "start_date": "$TODAY_STR", "end_date": "$TODAY_STR", "type": "all", "message": "今天早上的「草莓麵包」"}
     
     # (FIX #3) 新增 type 範例
     輸入: "查詢昨日支出"
@@ -1924,6 +2070,10 @@ def call_search_nlp(query_text, event_time):
 
     輸入: "查詢這禮拜的餐飲支出"
     輸出: {"status": "success", "keyword": "餐飲", "start_date": "$START_OF_WEEK", "end_date": "$END_OF_WEEK", "type": "expense", "message": "本週的 餐飲 支出"}
+
+    # (v4 新增範例)
+    輸入: "請問我11月信用卡消費金額"
+    輸出: {"status": "success", "keyword": "信用卡", "start_date": "$START_OF_MONTH", "end_date": "$TODAY_STR", "type": "expense", "message": "本月的 信用卡 支出"}
     """
     
     prompt = Template(prompt_raw).substitute(
@@ -1933,6 +2083,7 @@ def call_search_nlp(query_text, event_time):
         YESTERDAY_STR=yesterday_str,
         START_OF_WEEK=start_of_week.strftime('%Y-%m-%d'),
         END_OF_WEEK=end_of_week.strftime('%Y-%m-%d'),
+        START_OF_MONTH=start_of_month.strftime('%Y-%m-%d'), # (v4) 補上範例所需變數
     )
 
     try:
@@ -1950,7 +2101,7 @@ def call_search_nlp(query_text, event_time):
     except Exception as e:
         logger.error(f"Gemini Search API 呼叫失敗：{e}", exc_info=True)
         return {"status": "failure", "message": f"AI 分析器 API 呼叫失敗: {e}"}
-
+    
 # === (NEW) `handle_update_record_nlp` (佔位) ===
 def handle_update_record_nlp(sheet, user_id, text, event_time):
     """
