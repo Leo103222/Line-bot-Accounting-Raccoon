@@ -234,17 +234,20 @@ def handle_search_records_nlp(sheet, user_id, full_text, event_time):
     if not all_values or len(all_values) < 2:
         return f"🦝 找不到關於「{nlp_message}」的任何記錄喔 (帳本是空的)！"
         
-    header = all_values[0]
+        header = all_values[0]
     try:
         idx_uid = header.index('使用者ID')
-        idx_time_new = header.get('日期', -1)
-        idx_time_old = header.get('時間', -1)
         idx_amount = header.index('金額')
         idx_cat = header.index('類別')
         idx_note = header.index('備註')
-    except (ValueError, KeyError) as e:
+
+        # 嘗試找「日期」或「時間」欄
+        idx_time_new = header.index('日期') if '日期' in header else -1
+        idx_time_old = header.index('時間') if '時間' in header else -1
+    except ValueError as e:
         logger.error(f"GSheet 標頭錯誤 (handle_search_records_nlp): {e}")
         return "查詢失敗：GSheet 標頭欄位缺失。"
+
 
     matches = []
     
