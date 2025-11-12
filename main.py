@@ -204,6 +204,9 @@ def handle_list_categories(cat_sheet, user_id):
 # === *** (MODIFIED) 步驟三-B: 升級 `handle_search_records_nlp` (修復 Bug #3) *** ===
 # === *** (UPDATED 11-12) 重構為 get_all_values *** ===
 def handle_search_records_nlp(sheet, user_id, full_text, event_time):
+    header = all_values[0]
+    header_map = {name: idx for idx, name in enumerate(header)}
+
     """
     處理關鍵字和日期區間查詢 (使用 NLP)
     (已升級，支援收入/支出過濾)
@@ -234,20 +237,19 @@ def handle_search_records_nlp(sheet, user_id, full_text, event_time):
     if not all_values or len(all_values) < 2:
         return f"🦝 找不到關於「{nlp_message}」的任何記錄喔 (帳本是空的)！"
         
-        header = all_values[0]
+    # 常見欄位索引（若不存在給 -1，讓後續以條件判斷）
+    idx_time_new = header_map.get('日期', -1)
+    idx_time_old = header_map.get('時間', -1)
     try:
         idx_uid = header.index('使用者ID')
+        idx_time_new = header_map.get('日期', -1)
+        idx_time_old = header_map.get('時間', -1)
         idx_amount = header.index('金額')
         idx_cat = header.index('類別')
         idx_note = header.index('備註')
-
-        # 嘗試找「日期」或「時間」欄
-        idx_time_new = header.index('日期') if '日期' in header else -1
-        idx_time_old = header.index('時間') if '時間' in header else -1
-    except ValueError as e:
+    except (ValueError, KeyError) as e:
         logger.error(f"GSheet 標頭錯誤 (handle_search_records_nlp): {e}")
         return "查詢失敗：GSheet 標頭欄位缺失。"
-
 
     matches = []
     
@@ -348,7 +350,6 @@ def handle_search_records_nlp(sheet, user_id, full_text, event_time):
         reply += f"(僅顯示最近 {limit} 筆記錄)"
         
     return reply
-
 def handle_add_category(cat_sheet, user_id, text):
     """
     (新) 處理「新增類別」指令
@@ -388,6 +389,9 @@ def handle_add_category(cat_sheet, user_id, text):
         return f"新增類別時發生錯誤：{str(e)}"
 # (MODIFIED 11-12) 重構為 get_all_values
 def handle_total_analysis(sheet, user_id):
+    header = all_values[0]
+    header_map = {name: idx for idx, name in enumerate(header)}
+
     """
     處理 '總收支分析' 指令 (現在也包含了 '查帳')
     """
@@ -398,7 +402,9 @@ def handle_total_analysis(sheet, user_id):
         if not all_values or len(all_values) < 2:
             return "您目前沒有任何記帳記錄喔！"
 
-        header = all_values[0]
+        # 常見欄位索引（若不存在給 -1，讓後續以條件判斷）
+        idx_time_new = header_map.get('日期', -1)
+        idx_time_old = header_map.get('時間', -1)
         # 1. 先定義欄位索引
         try:
             idx_uid = header.index('使用者ID')
@@ -449,8 +455,7 @@ def handle_total_analysis(sheet, user_id):
         return reply
     except Exception as e:
         logger.error(f"總收支分析失败：{e}", exc_info=True)
-        return f"總收支分析報表產生失败：{str(e)}"
-    
+        return f"總收支分析報表產生失败：{str(e)}"    
 def handle_delete_category(cat_sheet, user_id, text):
     """
     (新) 處理「刪除類別」指令
@@ -1240,6 +1245,9 @@ def handle_nlp_record(sheet, budget_sheet, cat_sheet, text, user_id, user_name, 
 
 # (MODIFIED 11-12) 重構為 get_all_values
 def handle_monthly_report(sheet, user_id, event_time):
+    header = all_values[0]
+    header_map = {name: idx for idx, name in enumerate(header)}
+
     """
     處理 '月結' 指令
     """
@@ -1250,11 +1258,13 @@ def handle_monthly_report(sheet, user_id, event_time):
         if not all_values or len(all_values) < 2:
             return "您的帳本是空的，沒有記錄可分析。"
             
-        header = all_values[0]
+        # 常見欄位索引（若不存在給 -1，讓後續以條件判斷）
+        idx_time_new = header_map.get('日期', -1)
+        idx_time_old = header_map.get('時間', -1)
         try:
             idx_uid = header.index('使用者ID')
-            idx_time_new = header.get('日期', -1)
-            idx_time_old = header.get('時間', -1)
+            idx_time_new = header_map.get('日期', -1)
+            idx_time_old = header_map.get('時間', -1)
             idx_amount = header.index('金額')
             idx_cat = header.index('類別')
         except (ValueError, KeyError) as e:
@@ -1318,6 +1328,9 @@ def handle_monthly_report(sheet, user_id, event_time):
 
 # (MODIFIED 11-12) 重構為 get_all_values
 def handle_weekly_report(sheet, user_id, event_time):
+    header = all_values[0]
+    header_map = {name: idx for idx, name in enumerate(header)}
+
     """
     處理 '本週重點' 指令
     """
@@ -1328,11 +1341,13 @@ def handle_weekly_report(sheet, user_id, event_time):
         if not all_values or len(all_values) < 2:
             return "您的帳本是空的，沒有記錄可分析。"
             
-        header = all_values[0]
+        # 常見欄位索引（若不存在給 -1，讓後續以條件判斷）
+        idx_time_new = header_map.get('日期', -1)
+        idx_time_old = header_map.get('時間', -1)
         try:
             idx_uid = header.index('使用者ID')
-            idx_time_new = header.get('日期', -1)
-            idx_time_old = header.get('時間', -1)
+            idx_time_new = header_map.get('日期', -1)
+            idx_time_old = header_map.get('時間', -1)
             idx_amount = header.index('金額')
             idx_cat = header.index('類別')
         except (ValueError, KeyError) as e:
@@ -1416,8 +1431,10 @@ def handle_weekly_report(sheet, user_id, event_time):
     except Exception as e:
         logger.error(f"本週重點失敗：{e}", exc_info=True)
         return f"本週重點報表產生失敗：{str(e)}"
-
 def handle_delete_last_record(sheet, user_id):
+    header = all_values[0]
+    header_map = {name: idx for idx, name in enumerate(header)}
+
     """
     處理 '刪除' 指令，刪除使用者的 "最後一筆" 記錄
     """
@@ -1428,7 +1445,9 @@ def handle_delete_last_record(sheet, user_id):
         if not all_values:
             return "您的帳本是空的，沒有記錄可刪除。"
             
-        header = all_values[0]
+        # 常見欄位索引（若不存在給 -1，讓後續以條件判斷）
+        idx_time_new = header_map.get('日期', -1)
+        idx_time_old = header_map.get('時間', -1)
         try:
             user_id_col_index = header.index('使用者ID')
         except ValueError:
@@ -1456,6 +1475,9 @@ def handle_delete_last_record(sheet, user_id):
 
 # === (MODIFIED) 替換 handle_advanced_delete_nlp 函式 ===
 def handle_advanced_delete_nlp(sheet, user_id, full_text, event_time):
+    header = all_values[0]
+    header_map = {name: idx for idx, name in enumerate(header)}
+
     """
     (MODIFIED) 預覽刪除功能：使用 NLP 解析 full_text (例如 "刪掉早上的草莓麵包")
     (支援序號顯示與快取)
@@ -1495,7 +1517,9 @@ def handle_advanced_delete_nlp(sheet, user_id, full_text, event_time):
         if not all_values:
             return "🦝 您的帳本是空的，找不到記錄可刪除。"
             
-        header = all_values[0]
+        # 常見欄位索引（若不存在給 -1，讓後續以條件判斷）
+        idx_time_new = header_map.get('日期', -1)
+        idx_time_old = header_map.get('時間', -1)
         
         try:
             idx_uid = header.index('使用者ID')
@@ -1732,6 +1756,8 @@ def handle_set_budget(sheet, cat_sheet, text, user_id):
 
 # (MODIFIED 11-12) 重構 trx_sheet 的讀取
 def handle_view_budget(trx_sheet, budget_sheet, user_id, event_time):
+    header = all_values[0]
+
     """
     處理 '查看預算' 指令
     """
@@ -1749,7 +1775,6 @@ def handle_view_budget(trx_sheet, budget_sheet, user_id, event_time):
         header = []
         trx_data_rows = []
         if all_values and len(all_values) >= 2:
-            header = all_values[0]
             trx_data_rows = all_values[1:]
         else:
             logger.warning("查看預算時，Transactions GSheet 為空")
@@ -1843,14 +1868,17 @@ def handle_view_budget(trx_sheet, budget_sheet, user_id, event_time):
         logger.error(f"查看預算失敗：{e}", exc_info=True)
         return f"查看預算失敗：{str(e)}"
 
-# *** (UPDATED 11-02) ***
-# (修改點) 增加 user_name 參數
-# *** (UPDATED 11-02) ***
-# (修改點) 增加 user_name 參數
-# *** (UPDATED 11-12) ***
-# (修改點) 增加 user_name 參數
-# (重構) 改用 get_all_values
+    # *** (UPDATED 11-02) ***
+    # (修改點) 增加 user_name 參數
+    # *** (UPDATED 11-02) ***
+    # (修改點) 增加 user_name 參數
+    # *** (UPDATED 11-12) ***
+    # (修改點) 增加 user_name 參數
+    # (重構) 改用 get_all_values
+
 def handle_conversational_query_advice(trx_sheet, budget_sheet, text, user_id, user_name, event_time):
+    header = all_values[0]
+
     """
     (新功能) 處理 "詢問建議" (例如 "我花太多嗎", "有什麼建議")
     (MODIFIED 11-12) 重構為 get_all_values
@@ -1867,7 +1895,6 @@ def handle_conversational_query_advice(trx_sheet, budget_sheet, text, user_id, u
             logger.warning("GSheet (Transactions) 為空或只有標頭")
             return "🦝 您的帳本還是空的，沒辦法給建議喔～"
             
-        header = all_values[0]
         # (NEW) 建立標頭索引地圖
         header_map = {name: i for i, name in enumerate(header)}
         # (NEW) 傳遞 (標頭之後) 的所有資料
