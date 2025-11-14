@@ -158,6 +158,34 @@ def get_user_profile_name(user_id):
         logger.error(f"無法獲取使用者 {user_id} 的個人資料：{e}", exc_info=True)
         return "未知用戶"
 
+# === (通用) Google Sheet 讀取輔助函式 ===
+
+def fetch_sheet_values(sheet):
+    """一次性讀取 Google Sheet 的所有資料，並回傳標頭與資料列。"""
+    try:
+        all_values = sheet.get_all_values()
+    except Exception as e:
+        logger.error(f"讀取 Google Sheet 失敗：{e}", exc_info=True)
+        raise
+
+    if not all_values:
+        return [], {}, []
+
+    header = all_values[0]
+    header_map = {name: idx for idx, name in enumerate(header)}
+    data_rows = all_values[1:]
+    return header, header_map, data_rows
+
+
+def safe_get(row, idx, default=""):
+    """安全地從列中取得欄位值 (避免索引錯誤)。"""
+    if idx == -1:
+        return default
+    if idx < len(row):
+        return row[idx]
+    return default
+
+
 # === (NEW) 步驟三：新增類別管理相關函式 ===
 
 def get_user_categories(cat_sheet, user_id):
@@ -204,9 +232,6 @@ def handle_list_categories(cat_sheet, user_id):
 # === *** (MODIFIED) 步驟三-B: 升級 `handle_search_records_nlp` (修復 Bug #3) *** ===
 # === *** (UPDATED 11-12) 重構為 get_all_values *** ===
 def handle_search_records_nlp(sheet, user_id, full_text, event_time):
-    header = all_values[0]
-    header_map = {name: idx for idx, name in enumerate(header)}
-
     """
     處理關鍵字和日期區間查詢 (使用 NLP)
     (已升級，支援收入/支出過濾)
@@ -232,28 +257,27 @@ def handle_search_records_nlp(sheet, user_id, full_text, event_time):
         
     logger.debug(f"NLP 解析查詢結果：Keyword: {keyword}, Start: {start_date}, End: {end_date}, Type: {query_type}")
 
-    # (NEW 11-12) 效能優化
-    all_values = sheet.get_all_values()
-    if not all_values or len(all_values) < 2:
-        return f"🦝 找不到關於「{nlp_message}」的任何記錄喔 (帳本是空的)！"
-        
-    # 常見欄位索引（若不存在給 -1，讓後續以條件判斷）
-    idx_time_new = header.index('日期') if '日期' in header else -1
-    idx_time_old = header.index('時間') if '時間' in header else -1
-
     try:
-        idx_uid = header.index('使用者ID')
-        idx_time_new = header.index('日期') if '日期' in header else -1
-        idx_time_old = header.index('時間') if '時間' in header else -1
-        idx_amount = header.index('金額')
-        idx_cat = header.index('類別')
-        idx_note = header.index('備註')
-    except (ValueError, KeyError) as e:
-        logger.error(f"GSheet 標頭錯誤 (handle_search_records_nlp): {e}")
+        header, header_map, data_rows = fetch_sheet_values(sheet)
+    except Exception as e:
+        return f"查詢失敗：GSheet 讀取失敗：{str(e)}"
+
+    if not header or not data_rows:
+        return f"🦝 找不到關於「{nlp_message}」的任何記錄喔 (帳本是空的)！"
+
+    idx_uid = header_map.get('使用者ID', -1)
+    idx_amount = header_map.get('金額', -1)
+    idx_cat = header_map.get('類別', -1)
+    idx_note = header_map.get('備註', -1)
+    idx_time_new = header_map.get('日期', -1)
+    idx_time_old = header_map.get('時間', -1)
+
+    if idx_uid == -1 or idx_amount == -1 or idx_cat == -1:
+        logger.error("查詢失敗：Transactions 工作表缺少必要欄位 (使用者ID/金額/類別)")
         return "查詢失敗：GSheet 標頭欄位缺失。"
 
     matches = []
-    
+
     try:
         start_dt = datetime.strptime(start_date, '%Y-%m-%d').date() if start_date else None
         end_dt = datetime.strptime(end_date, '%Y-%m-%d').date() if end_date else None
@@ -261,48 +285,45 @@ def handle_search_records_nlp(sheet, user_id, full_text, event_time):
         return f"AI 回傳的日期格式錯誤 ({start_date}, {end_date})。"
 
     # (NEW 11-12) 遍歷原始 list
-    for r in all_values[1:]:
-        if len(r) <= max(idx_uid, idx_time_new, idx_time_old, idx_amount, idx_cat, idx_note):
+    for r in data_rows:
+        if safe_get(r, idx_uid) != user_id:
             continue
-            
-        if r[idx_uid] != user_id:
-            continue
-        
+
         keyword_match = True
         date_match = True
         type_match = True # (FIX #3) 新增類型比對
-        
+
         # 1. 關鍵字比對
-        category_val = r[idx_cat] if r[idx_cat] else ''
-        notes_val = r[idx_note] if r[idx_note] else ''
+        category_val = safe_get(r, idx_cat)
+        notes_val = safe_get(r, idx_note)
         if keyword:
             keyword_match = (keyword in category_val) or (keyword in notes_val)
-        
+
         # 2. 日期比對
         record_time_str = ""
-        if idx_time_new != -1 and len(r) > idx_time_new and r[idx_time_new]:
-            record_time_str = r[idx_time_new]
-        elif idx_time_old != -1 and len(r) > idx_time_old and r[idx_time_old]:
-            record_time_str = r[idx_time_old]
-            
+        if safe_get(r, idx_time_new):
+            record_time_str = safe_get(r, idx_time_new)
+        elif safe_get(r, idx_time_old):
+            record_time_str = safe_get(r, idx_time_old)
+
         if (start_dt or end_dt) and record_time_str:
             try:
                 record_dt = datetime.strptime(record_time_str[:10], '%Y-%m-%d').date()
                 if start_dt and record_dt < start_dt: date_match = False
                 if end_dt and record_dt > end_dt: date_match = False
             except ValueError:
-                date_match = False 
-        
+                date_match = False
+
         # 3. (FIX #3) 類型比對 (收入/支出)
         try:
-            amount = float(r[idx_amount])
+            amount = float(safe_get(r, idx_amount, '0'))
             if query_type == 'income' and amount <= 0: # 收入 (必須 > 0)
                 type_match = False
             if query_type == 'expense' and amount >= 0: # 支出 (必須 < 0)
                 type_match = False
         except (ValueError, TypeError):
             type_match = False # 金額格式錯誤，過濾掉
-        
+
         # 必須全部符合
         if keyword_match and date_match and type_match:
             # (NEW 11-12) 儲存原始的 row (list)，並附上時間戳 (用於排序)
@@ -390,29 +411,23 @@ def handle_add_category(cat_sheet, user_id, text):
         return f"新增類別時發生錯誤：{str(e)}"
 # (MODIFIED 11-12) 重構為 get_all_values
 def handle_total_analysis(sheet, user_id):
-    header = all_values[0]
-    header_map = {name: idx for idx, name in enumerate(header)}
-
     """
     處理 '總收支分析' 指令 (現在也包含了 '查帳')
     """
     logger.debug(f"處理 '總收支分析 / 查帳' (新版)，user_id: {user_id}")
     try:
-        # (NEW 11-12) 效能優化
-        all_values = sheet.get_all_values()
-        if not all_values or len(all_values) < 2:
+        header, header_map, data_rows = fetch_sheet_values(sheet)
+        if not header or not data_rows:
             return "您目前沒有任何記帳記錄喔！"
 
-        # 常見欄位索引（若不存在給 -1，讓後續以條件判斷）
+        idx_uid = header_map.get('使用者ID', -1)
+        idx_amount = header_map.get('金額', -1)
+        idx_cat = header_map.get('類別', -1)
         idx_time_new = header_map.get('日期', -1)
         idx_time_old = header_map.get('時間', -1)
-        # 1. 先定義欄位索引
-        try:
-            idx_uid = header.index('使用者ID')
-            idx_amount = header.index('金額')
-            idx_cat = header.index('類別')
-        except (ValueError, KeyError) as e:
-            logger.error(f"GSheet 標頭錯誤 (handle_total_analysis): {e}")
+
+        if idx_uid == -1 or idx_amount == -1 or idx_cat == -1:
+            logger.error("分析失敗：Transactions 工作表缺少必要欄位 (使用者ID/金額/類別)")
             return "分析失敗：GSheet 標頭欄位缺失。"
 
         total_income = 0.0
@@ -420,21 +435,22 @@ def handle_total_analysis(sheet, user_id):
         category_spending = {}
 
         # 2. 遍歷原始列表 (跳過標頭)
-        for r in all_values[1:]:
-            # 確保欄位足夠且是這位使用者
-            if len(r) > max(idx_uid, idx_amount, idx_cat) and r[idx_uid] == user_id:
-                try:
-                    amount = float(r[idx_amount])
-                    if amount > 0:
-                        total_income += amount
-                    else:
-                        expense = abs(amount)
-                        total_expense += expense
-                        category = r[idx_cat] if r[idx_cat] else '雜項'
-                        category_spending[category] = category_spending.get(category, 0) + expense
-                except (ValueError, TypeError):
-                    continue
-        
+        for r in data_rows:
+            if safe_get(r, idx_uid) != user_id:
+                continue
+
+            try:
+                amount = float(safe_get(r, idx_amount, '0'))
+                if amount > 0:
+                    total_income += amount
+                else:
+                    expense = abs(amount)
+                    total_expense += expense
+                    category = safe_get(r, idx_cat) or '雜項'
+                    category_spending[category] = category_spending.get(category, 0) + expense
+            except (ValueError, TypeError):
+                continue
+
         if total_income == 0 and total_expense == 0:
              return "您目前沒有任何記帳記錄喔！"
              
@@ -1246,30 +1262,23 @@ def handle_nlp_record(sheet, budget_sheet, cat_sheet, text, user_id, user_name, 
 
 # (MODIFIED 11-12) 重構為 get_all_values
 def handle_monthly_report(sheet, user_id, event_time):
-    header = all_values[0]
-    header_map = {name: idx for idx, name in enumerate(header)}
-
     """
     處理 '月結' 指令
     """
     logger.debug(f"處理 '月結' 指令，user_id: {user_id}")
     try:
-        # (NEW 11-12) 效能優化
-        all_values = sheet.get_all_values()
-        if not all_values or len(all_values) < 2:
+        header, header_map, data_rows = fetch_sheet_values(sheet)
+        if not header or not data_rows:
             return "您的帳本是空的，沒有記錄可分析。"
-            
-        # 常見欄位索引（若不存在給 -1，讓後續以條件判斷）
+
+        idx_uid = header_map.get('使用者ID', -1)
+        idx_amount = header_map.get('金額', -1)
+        idx_cat = header_map.get('類別', -1)
         idx_time_new = header_map.get('日期', -1)
         idx_time_old = header_map.get('時間', -1)
-        try:
-            idx_uid = header.index('使用者ID')
-            idx_time_new = header_map.get('日期', -1)
-            idx_time_old = header_map.get('時間', -1)
-            idx_amount = header.index('金額')
-            idx_cat = header.index('類別')
-        except (ValueError, KeyError) as e:
-            logger.error(f"GSheet 標頭錯誤 (handle_monthly_report): {e}")
+
+        if idx_uid == -1 or idx_amount == -1 or idx_cat == -1:
+            logger.error("月結失敗：Transactions 工作表缺少必要欄位 (使用者ID/金額/類別)")
             return "月結失敗：GSheet 標頭欄位缺失。"
 
         current_month_str = event_time.strftime('%Y-%m')
@@ -1279,28 +1288,25 @@ def handle_monthly_report(sheet, user_id, event_time):
         category_spending = {}
 
         # (NEW 11-12) 遍歷原始 list
-        for r in all_values[1:]:
-            if len(r) <= max(idx_uid, idx_time_new, idx_time_old, idx_amount, idx_cat):
+        for r in data_rows:
+            if safe_get(r, idx_uid) != user_id:
                 continue
-                
-            if r[idx_uid] != user_id:
-                continue
-                
+
             # (NEW) 優先讀取 '日期'，再讀取 '時間'
             record_time_str = ""
-            if idx_time_new != -1 and len(r) > idx_time_new and r[idx_time_new]:
-                record_time_str = r[idx_time_new]
-            elif idx_time_old != -1 and len(r) > idx_time_old and r[idx_time_old]:
-                record_time_str = r[idx_time_old]
+            if safe_get(r, idx_time_new):
+                record_time_str = safe_get(r, idx_time_new)
+            elif safe_get(r, idx_time_old):
+                record_time_str = safe_get(r, idx_time_old)
 
             if record_time_str.startswith(current_month_str):
                 try:
-                    amount = float(r[idx_amount])
+                    amount = float(safe_get(r, idx_amount, '0'))
                     if amount > 0:
                         total_income += amount
                     else:
                         total_expense += amount
-                        category = r[idx_cat] if r[idx_cat] else '雜項'
+                        category = safe_get(r, idx_cat) or '雜項'
                         category_spending[category] = category_spending.get(category, 0) + abs(amount)
                 except (ValueError, TypeError):
                     continue
@@ -1329,30 +1335,23 @@ def handle_monthly_report(sheet, user_id, event_time):
 
 # (MODIFIED 11-12) 重構為 get_all_values
 def handle_weekly_report(sheet, user_id, event_time):
-    header = all_values[0]
-    header_map = {name: idx for idx, name in enumerate(header)}
-
     """
     處理 '本週重點' 指令
     """
     logger.debug(f"處理 '本週重點' 指令，user_id: {user_id}")
     try:
-        # (NEW 11-12) 效能優化
-        all_values = sheet.get_all_values()
-        if not all_values or len(all_values) < 2:
+        header, header_map, data_rows = fetch_sheet_values(sheet)
+        if not header or not data_rows:
             return "您的帳本是空的，沒有記錄可分析。"
-            
-        # 常見欄位索引（若不存在給 -1，讓後續以條件判斷）
+
+        idx_uid = header_map.get('使用者ID', -1)
+        idx_amount = header_map.get('金額', -1)
+        idx_cat = header_map.get('類別', -1)
         idx_time_new = header_map.get('日期', -1)
         idx_time_old = header_map.get('時間', -1)
-        try:
-            idx_uid = header.index('使用者ID')
-            idx_time_new = header_map.get('日期', -1)
-            idx_time_old = header_map.get('時間', -1)
-            idx_amount = header.index('金額')
-            idx_cat = header.index('類別')
-        except (ValueError, KeyError) as e:
-            logger.error(f"GSheet 標頭錯誤 (handle_weekly_report): {e}")
+
+        if idx_uid == -1 or idx_amount == -1 or idx_cat == -1:
+            logger.error("週報表失敗：Transactions 工作表缺少必要欄位 (使用者ID/金額/類別)")
             return "週報表失敗：GSheet 標頭欄位缺失。"
 
         today = event_time.date()
@@ -1369,34 +1368,31 @@ def handle_weekly_report(sheet, user_id, event_time):
         day_spending = {} 
 
         # (NEW 11-12) 遍歷原始 list
-        for r in all_values[1:]:
-            if len(r) <= max(idx_uid, idx_time_new, idx_time_old, idx_amount, idx_cat):
+        for r in data_rows:
+            if safe_get(r, idx_uid) != user_id:
                 continue
-                
-            if r[idx_uid] != user_id:
-                continue
-            
+
             # (NEW) 優先讀取 '日期'，再讀取 '時間'
             record_time_str = ""
-            if idx_time_new != -1 and len(r) > idx_time_new and r[idx_time_new]:
-                record_time_str = r[idx_time_new]
-            elif idx_time_old != -1 and len(r) > idx_time_old and r[idx_time_old]:
-                record_time_str = r[idx_time_old]
-                
+            if safe_get(r, idx_time_new):
+                record_time_str = safe_get(r, idx_time_new)
+            elif safe_get(r, idx_time_old):
+                record_time_str = safe_get(r, idx_time_old)
+
             if not record_time_str:
                 continue
-            
+
             try:
                 record_date = datetime.strptime(record_time_str[:10], '%Y-%m-%d').date()
                 if start_of_week <= record_date <= end_of_week:
-                    amount = float(r[idx_amount])
+                    amount = float(safe_get(r, idx_amount, '0'))
                     if amount < 0:
                         expense = abs(amount)
                         total_expense += expense
-                        
-                        category = r[idx_cat] if r[idx_cat] else '雜項'
+
+                        category = safe_get(r, idx_cat) or '雜項'
                         category_spending[category] = category_spending.get(category, 0) + expense
-                        
+
                         record_date_str = record_time_str[:10]
                         day_spending[record_date_str] = day_spending.get(record_date_str, 0) + expense
             except (ValueError, TypeError):
@@ -1433,42 +1429,41 @@ def handle_weekly_report(sheet, user_id, event_time):
         logger.error(f"本週重點失敗：{e}", exc_info=True)
         return f"本週重點報表產生失敗：{str(e)}"
 def handle_delete_last_record(sheet, user_id):
-    header = all_values[0]
-    header_map = {name: idx for idx, name in enumerate(header)}
-
     """
     處理 '刪除' 指令，刪除使用者的 "最後一筆" 記錄
     """
     logger.debug(f"處理 '刪除' (最後一筆) 指令，user_id: {user_id}")
     try:
-        all_values = sheet.get_all_values()
-        
-        if not all_values:
+        header, header_map, data_rows = fetch_sheet_values(sheet)
+
+        if not header or not data_rows:
             return "您的帳本是空的，沒有記錄可刪除。"
-            
-        # 常見欄位索引（若不存在給 -1，讓後續以條件判斷）
-        idx_time_new = header_map.get('日期', -1)
-        idx_time_old = header_map.get('時間', -1)
-        try:
-            user_id_col_index = header.index('使用者ID')
-        except ValueError:
-            logger.warning("找不到 '使用者ID' 欄位，預設為 3 (D欄)")
-            user_id_col_index = 3 
-        
-        for row_index in range(len(all_values) - 1, 0, -1): 
-            row = all_values[row_index]
-            if len(row) > user_id_col_index and row[user_id_col_index] == user_id:
-                row_to_delete = row_index + 1
-                
+
+        user_id_col_index = header_map.get('使用者ID')
+        if user_id_col_index is None:
+            logger.warning("找不到 '使用者ID' 欄位，預設為第 4 欄 (索引 3)")
+            user_id_col_index = 3
+
+        amount_col_index = header_map.get('金額', 2)
+        date_col_index = header_map.get('日期', header_map.get('時間', 0))
+        category_col_index = header_map.get('類別', 1)
+
+        for idx in range(len(data_rows) - 1, -1, -1):
+            row = data_rows[idx]
+            if safe_get(row, user_id_col_index) == user_id:
+                gsheet_row = idx + 2  # header 為第 1 列
+
                 try:
-                    amount_val = float(row[2])
-                    deleted_desc = f"{row[0]} {row[1]} {amount_val:.0f} 元"
-                except (ValueError, TypeError, IndexError):
-                    deleted_desc = f"第 {row_to_delete} 行的記錄"
-                
-                sheet.delete_rows(row_to_delete)
+                    amount_val = float(safe_get(row, amount_col_index, '0'))
+                    date_val = safe_get(row, date_col_index)
+                    category_val = safe_get(row, category_col_index)
+                    deleted_desc = f"{date_val} {category_val} {amount_val:.0f} 元"
+                except (ValueError, TypeError):
+                    deleted_desc = f"第 {gsheet_row} 行的記錄"
+
+                sheet.delete_rows(gsheet_row)
                 return f"🗑️ 已刪除：{deleted_desc}"
-        
+
         return "找不到您的記帳記錄可供刪除。"
     except Exception as e:
         logger.error(f"刪除失敗：{e}", exc_info=True)
@@ -1476,9 +1471,6 @@ def handle_delete_last_record(sheet, user_id):
 
 # === (MODIFIED) 替換 handle_advanced_delete_nlp 函式 ===
 def handle_advanced_delete_nlp(sheet, user_id, full_text, event_time):
-    header = all_values[0]
-    header_map = {name: idx for idx, name in enumerate(header)}
-
     """
     (MODIFIED) 預覽刪除功能：使用 NLP 解析 full_text (例如 "刪掉早上的草莓麵包")
     (支援序號顯示與快取)
@@ -1513,52 +1505,40 @@ def handle_advanced_delete_nlp(sheet, user_id, full_text, event_time):
 
     # --- (GSheet 搜尋邏輯) ---
     try:
-        all_values = sheet.get_all_values()
-        
-        if not all_values:
+        header, header_map, data_rows = fetch_sheet_values(sheet)
+
+        if not header or not data_rows:
             return "🦝 您的帳本是空的，找不到記錄可刪除。"
-            
-        # 常見欄位索引（若不存在給 -1，讓後續以條件判斷）
-        idx_time_new = header_map.get('日期', -1)
-        idx_time_old = header_map.get('時間', -1)
-        
-        try:
-            idx_uid = header.index('使用者ID')
-            try:
-                idx_time = header.index('日期')
-            except ValueError:
-                idx_time = header.index('時間')
-            idx_cat = header.index('類別')
-            idx_note = header.index('備註')
-            idx_amount = header.index('金額')
-        except ValueError as e:
-            logger.error(f"預覽刪除失敗：GSheet 標頭欄位名稱錯誤或缺失: {e}")
+
+        idx_uid = header_map.get('使用者ID', -1)
+        idx_time = header_map.get('日期', header_map.get('時間', -1))
+        idx_cat = header_map.get('類別', -1)
+        idx_note = header_map.get('備註', -1)
+        idx_amount = header_map.get('金額', -1)
+
+        if idx_uid == -1 or idx_time == -1 or idx_cat == -1 or idx_amount == -1:
+            logger.error("預覽刪除失敗：Transactions 工作表缺少必要欄位")
             return "刪除失敗：找不到必要的 GSheet 欄位。請檢查 GSheet 標頭是否正確。"
-        
+
         # (MODIFIED) 儲存所有符合的記錄 (包含 GSheet 行號)
-        matches_found = [] 
-        
+        matches_found = []
+
         start_dt = datetime.strptime(start_date, '%Y-%m-%d').date() if start_date else None
         end_dt = datetime.strptime(end_date, '%Y-%m-%d').date() if end_date else None
         
         logger.debug("開始遍歷 GSheet Values 尋找刪除目標...")
         
-        for row_index in range(1, len(all_values)):
-            row = all_values[row_index]
-            
-            if len(row) <= max(idx_uid, idx_time, idx_cat, idx_note, idx_amount):
+        for idx, row in enumerate(data_rows, start=2):
+            if safe_get(row, idx_uid) != user_id:
                 continue
-            
-            if row[idx_uid] != user_id:
-                continue
-            
+
             keyword_match = True
             date_match = True
-            
+
             if keyword:
-                keyword_match = (keyword in row[idx_cat]) or (keyword in row[idx_note])
-            
-            record_datetime_str = row[idx_time]
+                keyword_match = (keyword in safe_get(row, idx_cat)) or (keyword in safe_get(row, idx_note))
+
+            record_datetime_str = safe_get(row, idx_time)
             if (start_dt or end_dt) and record_datetime_str:
                 try:
                     record_dt = datetime.strptime(record_datetime_str[:10], '%Y-%m-%d').date()
@@ -1570,11 +1550,11 @@ def handle_advanced_delete_nlp(sheet, user_id, full_text, event_time):
             if keyword_match and date_match:
                 # (MODIFIED) 儲存 GSheet 行號 (1-based) 和資訊
                 info_dict = {
-                    'gsheet_row': row_index + 1, 
+                    'gsheet_row': idx,
                     'date': record_datetime_str[:10] if record_datetime_str else 'N/A',
-                    'category': row[idx_cat] if len(row) > idx_cat else 'N/A',
-                    'amount': row[idx_amount] if len(row) > idx_amount else '0',
-                    'notes': row[idx_note] if len(row) > idx_note else 'N/A'
+                    'category': safe_get(row, idx_cat, 'N/A'),
+                    'amount': safe_get(row, idx_amount, '0'),
+                    'notes': safe_get(row, idx_note, 'N/A')
                 }
                 matches_found.append(info_dict)
         
@@ -1757,8 +1737,6 @@ def handle_set_budget(sheet, cat_sheet, text, user_id):
 
 # (MODIFIED 11-12) 重構 trx_sheet 的讀取
 def handle_view_budget(trx_sheet, budget_sheet, user_id, event_time):
-    header = all_values[0]
-
     """
     處理 '查看預算' 指令
     """
@@ -1766,27 +1744,14 @@ def handle_view_budget(trx_sheet, budget_sheet, user_id, event_time):
     try:
         budgets_records = budget_sheet.get_all_records()
         user_budgets = [b for b in budgets_records if b.get('使用者ID') == user_id]
-        
+
         if not user_budgets:
             return "您尚未設置任何預算。請輸入「設置預算 [類別] [限額]」"
 
-        # (NEW 11-12) 效能優化
-        all_values = trx_sheet.get_all_values()
-        
-        header = []
-        trx_data_rows = []
-        if all_values and len(all_values) >= 2:
-            trx_data_rows = all_values[1:]
-        else:
-            logger.warning("查看預算時，Transactions GSheet 為空")
-            
-        header_map = {name: i for i, name in enumerate(header)}
-        
-        # 必須的欄位
-        if '使用者ID' not in header_map or '金額' not in header_map or '類別' not in header_map:
-             logger.error("GSheet 標頭錯誤 (handle_view_budget): 關鍵欄位缺失")
-             # 即使 GSheet 為空，也回傳預算限額
-        
+        header, header_map, trx_data_rows = fetch_sheet_values(trx_sheet)
+        if not header:
+            logger.warning("查看預算時，Transactions GSheet 為空或缺少標頭")
+
         idx_uid = header_map.get('使用者ID', -1)
         idx_time_new = header_map.get('日期', -1)
         idx_time_old = header_map.get('時間', -1)
@@ -1794,27 +1759,25 @@ def handle_view_budget(trx_sheet, budget_sheet, user_id, event_time):
         idx_cat = header_map.get('類別', -1)
 
         current_month_str = event_time.strftime('%Y-%m')
-        
+
         # (NEW 11-12) 預先計算本月花費 (快)
         monthly_spending = {}
         if idx_uid != -1: # 只有在 GSheet 欄位都正常時才計算
             for r in trx_data_rows:
-                if len(r) <= max(idx_uid, idx_time_new, idx_time_old, idx_amount, idx_cat):
+                if safe_get(r, idx_uid) != user_id:
                     continue
-                if r[idx_uid] != user_id:
-                    continue
-                    
+
                 record_time_str = ""
-                if idx_time_new != -1 and len(r) > idx_time_new and r[idx_time_new]:
-                    record_time_str = r[idx_time_new]
-                elif idx_time_old != -1 and len(r) > idx_time_old and r[idx_time_old]:
-                    record_time_str = r[idx_time_old]
+                if safe_get(r, idx_time_new):
+                    record_time_str = safe_get(r, idx_time_new)
+                elif safe_get(r, idx_time_old):
+                    record_time_str = safe_get(r, idx_time_old)
 
                 if record_time_str.startswith(current_month_str):
                     try:
-                        amount = float(r[idx_amount])
+                        amount = float(safe_get(r, idx_amount, '0'))
                         if amount < 0:
-                            category = r[idx_cat] if r[idx_cat] else '雜項'
+                            category = safe_get(r, idx_cat) or '雜項'
                             monthly_spending[category] = monthly_spending.get(category, 0) + abs(amount)
                     except (ValueError, TypeError):
                         continue
@@ -1878,8 +1841,6 @@ def handle_view_budget(trx_sheet, budget_sheet, user_id, event_time):
     # (重構) 改用 get_all_values
 
 def handle_conversational_query_advice(trx_sheet, budget_sheet, text, user_id, user_name, event_time):
-    header = all_values[0]
-
     """
     (新功能) 處理 "詢問建議" (例如 "我花太多嗎", "有什麼建議")
     (MODIFIED 11-12) 重構為 get_all_values
@@ -1890,27 +1851,21 @@ def handle_conversational_query_advice(trx_sheet, budget_sheet, text, user_id, u
         # === (NEW 11-12) 步驟 0: 效能優化 (主要修復點) ===
         # 1. 一次性讀取所有 GSheet 原始值
         logger.debug("Optimizing: 正在讀取所有交易紀錄 (get_all_values)...")
-        all_values = trx_sheet.get_all_values()
-        
-        if not all_values or len(all_values) < 2:
+        header, header_map, data_rows = fetch_sheet_values(trx_sheet)
+
+        if not header or not data_rows:
             logger.warning("GSheet (Transactions) 為空或只有標頭")
             return "🦝 您的帳本還是空的，沒辦法給建議喔～"
-            
-        # (NEW) 建立標頭索引地圖
-        header_map = {name: i for i, name in enumerate(header)}
-        # (NEW) 傳遞 (標頭之後) 的所有資料
-        trx_data_rows = all_values[1:]
-        # ==========================================
 
         # 1. 取得本月資料 (使用你的輔助函式)
         this_month_date = event_time.date()
         # (MODIFIED 11-12) 傳入 (values, map, user_id, ...)
-        this_month_data = get_spending_data_for_month(trx_data_rows, header_map, user_id, this_month_date.year, this_month_date.month)
-        
+        this_month_data = get_spending_data_for_month(data_rows, header_map, user_id, this_month_date.year, this_month_date.month)
+
         # 2. 取得上月資料
         last_month_end_date = this_month_date.replace(day=1) - timedelta(days=1)
         # (MODIFIED 11-12) 重複使用 (values, map)
-        last_month_data = get_spending_data_for_month(trx_data_rows, header_map, user_id, last_month_end_date.year, last_month_end_date.month)
+        last_month_data = get_spending_data_for_month(data_rows, header_map, user_id, last_month_end_date.year, last_month_end_date.month)
         
         this_month_total = this_month_data['total']
         last_month_total = last_month_data['total']
@@ -1993,27 +1948,23 @@ def get_spending_data_for_month(all_trx_values, header_map, user_id, year, month
 
     # 5. (MODIFIED) 
     for r in all_trx_values: # 傳進來的 all_trx_values 應該已經不含 header
-        if len(r) <= max(idx_uid, idx_time_new, idx_time_old, idx_amount, idx_cat):
-            continue # 跳過不完整的行
-            
-        # 6. (MODIFIED) 
-        if r[idx_uid] != user_id:
+        if safe_get(r, idx_uid) != user_id:
             continue
-            
+
         # (NEW) 優先讀取 '日期'，再讀取 '時間'
         record_time_str = ""
-        if idx_time_new != -1 and len(r) > idx_time_new and r[idx_time_new]:
-            record_time_str = r[idx_time_new]
-        elif idx_time_old != -1 and len(r) > idx_time_old and r[idx_time_old]:
-            record_time_str = r[idx_time_old]
+        if safe_get(r, idx_time_new):
+            record_time_str = safe_get(r, idx_time_new)
+        elif safe_get(r, idx_time_old):
+            record_time_str = safe_get(r, idx_time_old)
 
         if record_time_str.startswith(month_str):
             try:
-                amount = float(r[idx_amount])
+                amount = float(safe_get(r, idx_amount, '0'))
                 if amount < 0:
                     expense = abs(amount)
                     total_expense += expense
-                    category = r[idx_cat] if r[idx_cat] else '雜項'
+                    category = safe_get(r, idx_cat) or '雜項'
                     category_spending[category] = category_spending.get(category, 0) + expense
             except (ValueError, TypeError):
                 continue
