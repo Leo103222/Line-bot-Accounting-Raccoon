@@ -108,5 +108,5 @@
 ---
 
 **作者**：黃瀚葳 (Hanwei)
-**版本**：v3.4（2025 年 11 月 2 日）– 全新類別系統 + AI 聊天升級！
+**版本**：v3.6（2025 年 11 月 14 日）– 優化執行速度 + 修正「list 沒有 get」導致的報表錯誤！
 **GitHub**：[Leo103222 / Line-bot-Accounting-Raccoon](https://github.com/Leo103222/Line-bot-Accounting-Raccoon)
