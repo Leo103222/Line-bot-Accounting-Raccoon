@@ -496,6 +496,7 @@ def get_user_intent(text, event_time):
     - RECORD: 明顯的記帳 (例如 "雞排 80", "收入 5000", "午餐100 晚餐200", "目前收入 39020 支出 45229" -> 這也是 RECORD)
     - DELETE: 明顯的刪除 (例如 "刪除 雞排", "刪掉 昨天", "幫我把早上的麵包刪掉")
     - UPDATE: 明顯的修改 (例如 "香蕉能改為餐飲嗎", "把昨天的 100 元改成 120")
+    - QUERY_REPORT: 查詢*匯總報表* (例如 "查帳", "月結", "本週重點", "總收支分析", "收支")
     - QUERY_DATA: 查詢*特定資料* (例如 "查詢 雞排", "查詢今天", "查詢這禮拜的餐飲")
     - QUERY_REPORT: 查詢*匯總報表* (例如 "查帳", "月結", "本週重點", "總收支分析")
     - QUERY_ADVICE: 詢問*建議* (例如 "我本月花太多嗎？", "有什麼建議")
@@ -711,7 +712,7 @@ def handle_message(event):
         # 報表查詢
         elif user_intent == "QUERY_REPORT":
             logger.debug("意圖：QUERY_REPORT (查詢報表)")
-            if "查帳" in text or "總收支" in text or "總分析" in text:
+            if "查帳" in text or "總收支" in text or "總分析" in text or text == "收支":
                 reply_text = handle_total_analysis(trx_sheet, user_id)
             elif "月結" in text:
                 reply_text = handle_monthly_report(trx_sheet, user_id, event_time)
@@ -991,7 +992,8 @@ def handle_nlp_record(sheet, budget_sheet, cat_sheet, text, user_id, user_name, 
        - (規則 5.1) 缺少關鍵資訊 (例如 "雞排" (沒說金額))。
        - (規則 5.2) 嚴格禁止在沒有明确金額時*猜測*一個數字。
        - (規則 5.3) **無意義輸入**: 如果使用者的輸入*完全*由標點符號、亂碼或單一表情符號組成 (例如 "...", "???", "////", "：：：", "…", "😅")，這*不是*記帳，應視為 "failure"。
-
+       - (規則 5.3) 若使用者僅輸入「收支」、「收入」、「支出」等抽象名詞且無金額，視為 failure 或 chat，絕不可記帳。
+       - (規則 5.4) **無意義輸入**: 如果使用者的輸入*完全*由標點符號... (略)
     ---
     ### (次要規則) 解析規則 (記帳成功)
     ---
