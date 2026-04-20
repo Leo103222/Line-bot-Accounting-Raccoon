@@ -1,0 +1,22 @@
+venv/
+# 系統產生的檔案
+.DS_Store
+Thumbs.db
+
+# 依賴目錄
+node_modules/
+bower_components/
+
+# 編輯器設定
+.vscode/
+.idea/
+
+# 建置產物
+dist/
+build/
+*.exe
+*.dll
+
+# 環境變數與祕鑰
+.env
+.env.local
