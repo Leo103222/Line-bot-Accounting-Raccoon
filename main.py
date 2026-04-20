@@ -1,9 +1,5 @@
 #小浣熊v3.6
-<<<<<<< HEAD
-
-=======
 from openai import OpenAI
->>>>>>> 4ec30e7 (改用 NVIDIA NIM)
 import os
 import logging
 import re
@@ -44,11 +40,7 @@ LINE_CHANNEL_SECRET = os.getenv("LINE_CHANNEL_SECRET")
 GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
 GOOGLE_SHEET_NAME = os.getenv("GOOGLE_SHEET_NAME", '記帳小浣熊資料庫')
 GOOGLE_SHEET_ID = os.getenv("GOOGLE_SHEET_ID")
-<<<<<<< HEAD
-
-=======
 NVIDIA_API_KEY = os.getenv("NVIDIA_API_KEY")
->>>>>>> 4ec30e7 (改用 NVIDIA NIM)
 # 檢查金鑰
 if not all([LINE_CHANNEL_ACCESS_TOKEN, LINE_CHANNEL_SECRET, GEMINI_API_KEY, GOOGLE_SHEET_ID]):
     logger.error("!!! 關鍵金鑰載入失敗 !!!")
@@ -1080,10 +1072,13 @@ def handle_nlp_record(sheet, budget_sheet, cat_sheet, text, user_id, user_name, 
             messages=[{"role": "user", "content": prompt}],
             temperature=0.1 
         )
-        clean_response = response.choices[0].message.content.strip()
-        clean_response = clean_response.replace("```json", "").replace("```", "")
-        # clean_response = response.text.strip().replace("```json", "").replace("```", "")
-        logger.debug(f"Gemini NLP response: {clean_response}")
+        # 抓出 AI 回傳的文字
+        raw_content = response.choices[0].message.content.strip()
+
+        # 暴力清除可能帶有的 Markdown 標記
+        clean_response = raw_content.replace("```json\n", "").replace("```json", "").replace("```\n", "").replace("```", "").strip()
+
+        logger.debug(f"Minimax NLP response: {clean_response}")
         
         data = json.loads(clean_response)
         status = data.get('status')
